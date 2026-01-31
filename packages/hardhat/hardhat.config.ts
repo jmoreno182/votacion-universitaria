@@ -27,7 +27,7 @@ const config: HardhatUserConfig = {
   solidity: {
     compilers: [
       {
-        version: "0.8.30",
+        version: "0.8.20",
         settings: {
           optimizer: {
             enabled: true,
@@ -53,6 +53,12 @@ const config: HardhatUserConfig = {
         url: `https://eth-mainnet.alchemyapi.io/v2/${providerApiKey}`,
         enabled: process.env.MAINNET_FORKING_ENABLED === "true",
       },
+    },
+    // ✅ Red local cuando ejecutas `yarn chain`
+    // hardhat node escucha en 127.0.0.1:8545
+    localhost: {
+      url: "http://127.0.0.1:8545",
+      accounts: [deployerPrivateKey],
     },
     mainnet: {
       url: "https://mainnet.rpc.buidlguidl.com",

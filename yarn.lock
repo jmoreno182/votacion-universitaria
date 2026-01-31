@@ -3884,7 +3884,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@scaffold-ui/debug-contracts@npm:^0.1.7":
+"@scaffold-ui/debug-contracts@npm:^0.1.7, @scaffold-ui/debug-contracts@npm:latest":
   version: 0.1.7
   resolution: "@scaffold-ui/debug-contracts@npm:0.1.7"
   dependencies:
@@ -17406,6 +17406,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "se-2@workspace:."
   dependencies:
+    "@scaffold-ui/debug-contracts": latest
     husky: ^9.1.6
     lint-staged: ^15.2.10
   languageName: unknown

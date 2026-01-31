@@ -4,6 +4,723 @@
  */
 import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 
-const deployedContracts = {} as const;
+const deployedContracts = {
+  31337: {
+    VotacionUniversitaria: {
+      address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      abi: [
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "ownerInicial",
+              type: "address",
+            },
+          ],
+          stateMutability: "nonpayable",
+          type: "constructor",
+        },
+        {
+          inputs: [],
+          name: "OpcionInvalida",
+          type: "error",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "owner",
+              type: "address",
+            },
+          ],
+          name: "OwnableInvalidOwner",
+          type: "error",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "account",
+              type: "address",
+            },
+          ],
+          name: "OwnableUnauthorizedAccount",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "ParametrosInvalidos",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "VotacionCerrada",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "VotacionNoExiste",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "YaVotaste",
+          type: "error",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "address",
+              name: "previousOwner",
+              type: "address",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "newOwner",
+              type: "address",
+            },
+          ],
+          name: "OwnershipTransferred",
+          type: "event",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "creador",
+              type: "address",
+            },
+            {
+              indexed: false,
+              internalType: "string",
+              name: "titulo",
+              type: "string",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "fechaFin",
+              type: "uint256",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "cantidadOpciones",
+              type: "uint256",
+            },
+          ],
+          name: "VotacionCreada",
+          type: "event",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "votante",
+              type: "address",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "idOpcion",
+              type: "uint256",
+            },
+          ],
+          name: "VotoEmitido",
+          type: "event",
+        },
+        {
+          inputs: [],
+          name: "bloqueDespliegue",
+          outputs: [
+            {
+              internalType: "uint64",
+              name: "",
+              type: "uint64",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "contadorVotaciones",
+          outputs: [
+            {
+              internalType: "uint256",
+              name: "",
+              type: "uint256",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "string",
+              name: "titulo",
+              type: "string",
+            },
+            {
+              internalType: "string[]",
+              name: "opciones",
+              type: "string[]",
+            },
+            {
+              internalType: "uint256",
+              name: "duracionSegundos",
+              type: "uint256",
+            },
+          ],
+          name: "crearVotacion",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+          ],
+          name: "obtenerOpciones",
+          outputs: [
+            {
+              internalType: "string[]",
+              name: "",
+              type: "string[]",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+          ],
+          name: "obtenerVotacion",
+          outputs: [
+            {
+              internalType: "string",
+              name: "titulo",
+              type: "string",
+            },
+            {
+              internalType: "address",
+              name: "creador",
+              type: "address",
+            },
+            {
+              internalType: "uint256",
+              name: "fechaFin",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "cantidadOpciones",
+              type: "uint256",
+            },
+            {
+              internalType: "bool",
+              name: "activa",
+              type: "bool",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "opcion",
+              type: "uint256",
+            },
+          ],
+          name: "obtenerVotos",
+          outputs: [
+            {
+              internalType: "uint256",
+              name: "",
+              type: "uint256",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "owner",
+          outputs: [
+            {
+              internalType: "address",
+              name: "",
+              type: "address",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "renounceOwnership",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "newOwner",
+              type: "address",
+            },
+          ],
+          name: "transferOwnership",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "idOpcion",
+              type: "uint256",
+            },
+          ],
+          name: "votar",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              internalType: "address",
+              name: "cuenta",
+              type: "address",
+            },
+          ],
+          name: "yaVoto",
+          outputs: [
+            {
+              internalType: "bool",
+              name: "",
+              type: "bool",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+      ],
+      inheritedFunctions: {
+        owner: "@openzeppelin/contracts/access/Ownable.sol",
+        renounceOwnership: "@openzeppelin/contracts/access/Ownable.sol",
+        transferOwnership: "@openzeppelin/contracts/access/Ownable.sol",
+      },
+      deployedOnBlock: 1,
+    },
+  },
+  11155111: {
+    VotacionUniversitaria: {
+      address: "0xB79Ce2e12B8C7Ab70A3F79618710CcdAE77c107f",
+      abi: [
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "ownerInicial",
+              type: "address",
+            },
+          ],
+          stateMutability: "nonpayable",
+          type: "constructor",
+        },
+        {
+          inputs: [],
+          name: "OpcionInvalida",
+          type: "error",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "owner",
+              type: "address",
+            },
+          ],
+          name: "OwnableInvalidOwner",
+          type: "error",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "account",
+              type: "address",
+            },
+          ],
+          name: "OwnableUnauthorizedAccount",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "ParametrosInvalidos",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "VotacionCerrada",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "VotacionNoExiste",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "YaVotaste",
+          type: "error",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "address",
+              name: "previousOwner",
+              type: "address",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "newOwner",
+              type: "address",
+            },
+          ],
+          name: "OwnershipTransferred",
+          type: "event",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "creador",
+              type: "address",
+            },
+            {
+              indexed: false,
+              internalType: "string",
+              name: "titulo",
+              type: "string",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "fechaFin",
+              type: "uint256",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "cantidadOpciones",
+              type: "uint256",
+            },
+          ],
+          name: "VotacionCreada",
+          type: "event",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "votante",
+              type: "address",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "idOpcion",
+              type: "uint256",
+            },
+          ],
+          name: "VotoEmitido",
+          type: "event",
+        },
+        {
+          inputs: [],
+          name: "bloqueDespliegue",
+          outputs: [
+            {
+              internalType: "uint64",
+              name: "",
+              type: "uint64",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "contadorVotaciones",
+          outputs: [
+            {
+              internalType: "uint256",
+              name: "",
+              type: "uint256",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "string",
+              name: "titulo",
+              type: "string",
+            },
+            {
+              internalType: "string[]",
+              name: "opciones",
+              type: "string[]",
+            },
+            {
+              internalType: "uint256",
+              name: "duracionSegundos",
+              type: "uint256",
+            },
+          ],
+          name: "crearVotacion",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+          ],
+          name: "obtenerOpciones",
+          outputs: [
+            {
+              internalType: "string[]",
+              name: "",
+              type: "string[]",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+          ],
+          name: "obtenerVotacion",
+          outputs: [
+            {
+              internalType: "string",
+              name: "titulo",
+              type: "string",
+            },
+            {
+              internalType: "address",
+              name: "creador",
+              type: "address",
+            },
+            {
+              internalType: "uint256",
+              name: "fechaFin",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "cantidadOpciones",
+              type: "uint256",
+            },
+            {
+              internalType: "bool",
+              name: "activa",
+              type: "bool",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "opcion",
+              type: "uint256",
+            },
+          ],
+          name: "obtenerVotos",
+          outputs: [
+            {
+              internalType: "uint256",
+              name: "",
+              type: "uint256",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "owner",
+          outputs: [
+            {
+              internalType: "address",
+              name: "",
+              type: "address",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "renounceOwnership",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "newOwner",
+              type: "address",
+            },
+          ],
+          name: "transferOwnership",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "idOpcion",
+              type: "uint256",
+            },
+          ],
+          name: "votar",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "idVotacion",
+              type: "uint256",
+            },
+            {
+              internalType: "address",
+              name: "cuenta",
+              type: "address",
+            },
+          ],
+          name: "yaVoto",
+          outputs: [
+            {
+              internalType: "bool",
+              name: "",
+              type: "bool",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+      ],
+      inheritedFunctions: {
+        owner: "@openzeppelin/contracts/access/Ownable.sol",
+        renounceOwnership: "@openzeppelin/contracts/access/Ownable.sol",
+        transferOwnership: "@openzeppelin/contracts/access/Ownable.sol",
+      },
+      deployedOnBlock: 10152828,
+    },
+  },
+} as const;
 
 export default deployedContracts satisfies GenericContractsDeclaration;

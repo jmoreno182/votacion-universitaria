@@ -1,11 +1,10 @@
 import { connectorsForWallets } from "@rainbow-me/rainbowkit";
 import {
-  baseAccount,
   ledgerWallet,
   metaMaskWallet,
   rainbowWallet,
   safeWallet,
-  walletConnectWallet,
+  walletConnectWallet, // 🚫 baseAccount REMOVIDO: causa "telemetry script" + Runtime Error undefined
 } from "@rainbow-me/rainbowkit/wallets";
 import { rainbowkitBurnerWallet } from "burner-connector";
 import * as chains from "viem/chains";
@@ -13,16 +12,25 @@ import scaffoldConfig from "~~/scaffold.config";
 
 const { onlyLocalBurnerWallet, targetNetworks } = scaffoldConfig;
 
+/**
+ * ✅ Burner Wallet:
+ * - Se muestra SOLO si:
+ *   a) estás 100% en hardhat (no hay redes externas), o
+ *   b) onlyLocalBurnerWallet es false (como ya lo tienes ahora)
+ */
+const shouldIncludeBurner =
+  !targetNetworks.some(network => network.id !== (chains.hardhat as chains.Chain).id) || !onlyLocalBurnerWallet;
+
+/**
+ * ✅ Lista de wallets (sin Base Smart Account para evitar errores de telemetría)
+ */
 const wallets = [
   metaMaskWallet,
   walletConnectWallet,
   ledgerWallet,
-  baseAccount,
   rainbowWallet,
   safeWallet,
-  ...(!targetNetworks.some(network => network.id !== (chains.hardhat as chains.Chain).id) || !onlyLocalBurnerWallet
-    ? [rainbowkitBurnerWallet]
-    : []),
+  ...(shouldIncludeBurner ? [rainbowkitBurnerWallet] : []),
 ];
 
 /**
@@ -38,13 +46,13 @@ export const wagmiConnectors = () => {
   return connectorsForWallets(
     [
       {
-        groupName: "Supported Wallets",
+        groupName: "Wallets compatibles",
         wallets,
       },
     ],
-
     {
-      appName: "scaffold-eth-2",
+      // ✅ Nombre más coherente para tu dApp (no afecta nada, solo UX)
+      appName: "Votación Universitaria",
       projectId: scaffoldConfig.walletConnectProjectId,
     },
   );
