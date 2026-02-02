@@ -14,7 +14,11 @@ import { notification } from "~~/utils/scaffold-eth";
  * - Filtros pro (tipo, búsqueda, idVotacion)
  * - Paginación
  * - Links a explorer en Sepolia
- * - Cache simple (timestamps por bloque en la carga actual)
+ *
+ * ✅ Optimización anti-límites RPC:
+ * - NO escanea desde despliegue → latest (rango enorme)
+ * - Solo consulta logs en los últimos N bloques
+ * - Solo muestra los últimos 10 eventos (y timestamps solo para esos)
  */
 
 type Pestaña = "actividad" | "transacciones" | "bloques";
@@ -67,7 +71,6 @@ function tiempoHace(segundosEpoch?: number) {
 }
 
 function copiarAlPortapapeles(texto: string) {
-  // 1) Clipboard API moderna (solo si existe)
   const clipboard = typeof navigator !== "undefined" ? navigator.clipboard : undefined;
 
   if (clipboard?.writeText) {
@@ -75,27 +78,18 @@ function copiarAlPortapapeles(texto: string) {
       .writeText(texto)
       .then(() => notification.success("Copiado"))
       .catch(() => {
-        // Si falla por permisos, intentamos fallback
-        if (copiarFallback(texto)) {
-          notification.success("Copiado");
-        } else {
-          notification.error("No se pudo copiar");
-        }
+        if (copiarFallback(texto)) notification.success("Copiado");
+        else notification.error("No se pudo copiar");
       });
     return;
   }
 
-  // 2) Fallback clásico
-  if (copiarFallback(texto)) {
-    notification.success("Copiado");
-  } else {
-    notification.error("No se pudo copiar");
-  }
+  if (copiarFallback(texto)) notification.success("Copiado");
+  else notification.error("No se pudo copiar");
 }
 
 function copiarFallback(texto: string) {
   try {
-    // Debe ejecutarse en respuesta a un click del usuario (tu caso sí)
     const textarea = document.createElement("textarea");
     textarea.value = texto;
     textarea.setAttribute("readonly", "true");
@@ -141,9 +135,12 @@ function esNumeroEnteroPositivo(s: string) {
 }
 
 export default function PaginaExplorador() {
-  // ✅ Ajusta a gusto
-  const TAM_PAGINA = 25; // lo que tú pediste
-  const MAX_EVENTOS_CARGA = 300; // para paginar sin pedir “todo” (suficiente para demo)
+  // ✅ UI: puedes dejar paginación, pero con 10 eventos realmente será 1 página
+  const TAM_PAGINA = 25;
+
+  // ✅ Anti-límites RPC:
+  const MAX_EVENTOS_MOSTRAR = 10; // SOLO 10 eventos
+  const BLOQUES_LOGS_RECIENTES = 5_000n; // solo últimos 5000 bloques (ajusta 2000–20000)
 
   const { targetNetwork } = useTargetNetwork();
   const explorerBase = (targetNetwork as any)?.blockExplorerUrl as string | undefined;
@@ -155,7 +152,7 @@ export default function PaginaExplorador() {
 
   const contractAddress = deployedContractData?.address as `0x${string}` | undefined;
 
-  // ✅ bloque real de despliegue: perfecto para reconstruir logs Hardhat/Sepolia
+  // (lo dejamos por compatibilidad, pero ya no usamos from=despliegue→latest)
   const { data: bloqueDespliegue } = useScaffoldReadContract({
     contractName: "VotacionUniversitaria",
     functionName: "bloqueDespliegue",
@@ -164,14 +161,14 @@ export default function PaginaExplorador() {
   // UI state
   const [pestana, setPestana] = useState<Pestaña>("actividad");
 
-  // Filtros pro (Actividad)
+  // Filtros pro
   const [tipoFiltro, setTipoFiltro] = useState<TipoActividad>("todas");
-  const [busqueda, setBusqueda] = useState(""); // busca en título, creador/votante, txHash
-  const [idVotacionFiltro, setIdVotacionFiltro] = useState(""); // idVotacion exacto
-  const [soloConMiContrato, setSoloConMiContrato] = useState(true); // (tiene sentido cuando luego agregues otras address)
-  const [ordenDesc, setOrdenDesc] = useState(true); // más reciente primero
+  const [busqueda, setBusqueda] = useState("");
+  const [idVotacionFiltro, setIdVotacionFiltro] = useState("");
+  const [soloConMiContrato, setSoloConMiContrato] = useState(true);
+  const [ordenDesc, setOrdenDesc] = useState(true);
 
-  // Paginación (Actividad y Tx)
+  // Paginación
   const [paginaActividad, setPaginaActividad] = useState(1);
   const [paginaTx, setPaginaTx] = useState(1);
 
@@ -180,7 +177,6 @@ export default function PaginaExplorador() {
   const [actividad, setActividad] = useState<Actividad[]>([]);
   const [bloques, setBloques] = useState<any[]>([]);
 
-  // ABI events (parse once)
   const eventoVotacionCreada = useMemo(
     () =>
       parseAbiItem(
@@ -195,34 +191,36 @@ export default function PaginaExplorador() {
   );
 
   // Reset paginación cuando cambian filtros relevantes
-  useEffect(() => {
-    setPaginaActividad(1);
-  }, [tipoFiltro, busqueda, idVotacionFiltro, ordenDesc]);
-
-  useEffect(() => {
-    setPaginaTx(1);
-  }, [busqueda, idVotacionFiltro, ordenDesc]);
+  useEffect(() => setPaginaActividad(1), [tipoFiltro, busqueda, idVotacionFiltro, ordenDesc]);
+  useEffect(() => setPaginaTx(1), [busqueda, idVotacionFiltro, ordenDesc]);
 
   const recargar = useCallback(async () => {
     if (!publicClient || !contractAddress) return;
 
     setCargando(true);
     try {
-      const desde = BigInt(bloqueDespliegue ?? 0n);
+      // ✅ Rango seguro: últimos N bloques
+      const ultimoBloque = await publicClient.getBlockNumber();
 
-      // 1) Logs (dos tipos)
+      const desdePorRango = ultimoBloque > BLOQUES_LOGS_RECIENTES ? ultimoBloque - BLOQUES_LOGS_RECIENTES : 0n;
+
+      // ✅ Si tienes bloqueDespliegue, lo respetamos solo si es más reciente que el rango (evita irte muy atrás)
+      const desdeDeploy = BigInt(bloqueDespliegue ?? 0n);
+      const desde = desdeDeploy > desdePorRango ? desdeDeploy : desdePorRango;
+
+      // 1) Logs (dos tipos) SOLO en rango pequeño
       const [logsCreada, logsVoto] = await Promise.all([
         publicClient.getLogs({
           address: contractAddress,
           event: eventoVotacionCreada,
           fromBlock: desde,
-          toBlock: "latest",
+          toBlock: ultimoBloque,
         }),
         publicClient.getLogs({
           address: contractAddress,
           event: eventoVotoEmitido,
           fromBlock: desde,
-          toBlock: "latest",
+          toBlock: ultimoBloque,
         }),
       ]);
 
@@ -254,39 +252,33 @@ export default function PaginaExplorador() {
         });
       }
 
-      // Orden base por bloque (desc)
+      // Orden base por bloque (desc) y toma SOLO los últimos 10
       combinados.sort((a, b) => {
         if (a.bloque === b.bloque) return a.txHash.localeCompare(b.txHash);
         return Number(b.bloque - a.bloque);
       });
 
-      // Limitar carga para paginación
-      const recortados = combinados.slice(0, MAX_EVENTOS_CARGA);
+      const ultimos = combinados.slice(0, MAX_EVENTOS_MOSTRAR);
 
-      // 2) Timestamps por bloque (cache por recarga)
-      const bloquesUnicos = Array.from(new Set(recortados.map(x => x.bloque.toString()))).map(x => BigInt(x));
+      // 2) Timestamps SOLO para esos 10 eventos (máx 10 bloques únicos)
+      const bloquesUnicos = Array.from(new Set(ultimos.map(x => x.bloque.toString()))).map(x => BigInt(x));
       const mapaTs = new Map<string, number>();
 
-      await Promise.all(
-        bloquesUnicos.map(async bn => {
-          try {
-            const b = await publicClient.getBlock({ blockNumber: bn });
-            const ts = Number((b as any).timestamp ?? 0n);
-            mapaTs.set(bn.toString(), ts);
-          } catch {
-            // ignore
-          }
-        }),
-      );
+      // ✅ Secuencial (evita bursts de requests)
+      for (const bn of bloquesUnicos) {
+        try {
+          const b = await publicClient.getBlock({ blockNumber: bn });
+          mapaTs.set(bn.toString(), Number((b as any).timestamp ?? 0n));
+        } catch {
+          // ignore
+        }
+      }
 
-      const conTiempo = recortados.map(x => ({ ...x, timestamp: mapaTs.get(x.bloque.toString()) }));
-
+      const conTiempo = ultimos.map(x => ({ ...x, timestamp: mapaTs.get(x.bloque.toString()) }));
       setActividad(conTiempo);
 
-      // 3) Bloques recientes (tipo etherscan, simple)
-      const ultimoBloque = await publicClient.getBlockNumber();
+      // 3) Bloques recientes (10)
       const cantidadBloques = 10;
-
       const lista: any[] = [];
       for (let i = 0; i < cantidadBloques; i++) {
         const bn = ultimoBloque - BigInt(i);
@@ -298,14 +290,21 @@ export default function PaginaExplorador() {
           // ignore
         }
       }
-
       setBloques(lista);
     } catch (e: any) {
       notification.error(e?.shortMessage ?? e?.message ?? "Error cargando datos del explorador");
     } finally {
       setCargando(false);
     }
-  }, [publicClient, contractAddress, bloqueDespliegue, eventoVotacionCreada, eventoVotoEmitido]);
+  }, [
+    publicClient,
+    contractAddress,
+    bloqueDespliegue,
+    eventoVotacionCreada,
+    eventoVotoEmitido,
+    BLOQUES_LOGS_RECIENTES,
+    MAX_EVENTOS_MOSTRAR,
+  ]);
 
   useEffect(() => {
     if (!publicClient || !contractAddress) return;
@@ -325,29 +324,24 @@ export default function PaginaExplorador() {
   const actividadFiltrada = useMemo(() => {
     let lista = [...actividad];
 
-    // (por si luego extiendes a varios contratos; hoy siempre es true)
     if (!soloConMiContrato) {
-      // no-op
+      // no-op (placeholder)
     }
 
-    // Tipo
     if (tipoFiltro !== "todas") {
       lista = lista.filter(a => a.tipo === tipoFiltro);
     }
 
-    // idVotacion exacto
     const idTxt = idVotacionFiltro.trim();
     if (idTxt) {
       if (esNumeroEnteroPositivo(idTxt)) {
         const id = BigInt(Number(idTxt));
         lista = lista.filter(a => a.idVotacion === id);
       } else {
-        // si escriben basura, mostramos vacío (mejor UX)
         lista = [];
       }
     }
 
-    // Búsqueda libre
     const q = normalizarTexto(busqueda);
     if (q) {
       lista = lista.filter(a => {
@@ -364,7 +358,6 @@ export default function PaginaExplorador() {
       });
     }
 
-    // Orden
     lista.sort((a, b) => {
       if (a.bloque === b.bloque) return a.txHash.localeCompare(b.txHash);
       return ordenDesc ? Number(b.bloque - a.bloque) : Number(a.bloque - b.bloque);
@@ -374,22 +367,23 @@ export default function PaginaExplorador() {
   }, [actividad, tipoFiltro, busqueda, idVotacionFiltro, ordenDesc, soloConMiContrato]);
 
   // ---- Paginación Actividad ----
-  const totalPaginasActividad = useMemo(() => {
-    return Math.max(1, Math.ceil(actividadFiltrada.length / TAM_PAGINA));
-  }, [actividadFiltrada.length]);
+  const totalPaginasActividad = useMemo(() => Math.max(1, Math.ceil(actividadFiltrada.length / TAM_PAGINA)), [
+    actividadFiltrada.length,
+    TAM_PAGINA,
+  ]);
 
-  const paginaActividadSegura = useMemo(() => {
-    return Math.min(Math.max(paginaActividad, 1), totalPaginasActividad);
-  }, [paginaActividad, totalPaginasActividad]);
+  const paginaActividadSegura = useMemo(
+    () => Math.min(Math.max(paginaActividad, 1), totalPaginasActividad),
+    [paginaActividad, totalPaginasActividad],
+  );
 
   const actividadPagina = useMemo(() => {
     const ini = (paginaActividadSegura - 1) * TAM_PAGINA;
     return actividadFiltrada.slice(ini, ini + TAM_PAGINA);
-  }, [actividadFiltrada, paginaActividadSegura]);
+  }, [actividadFiltrada, paginaActividadSegura, TAM_PAGINA]);
 
   // ---- Transacciones derivadas (únicas por txHash) + filtros + paginación ----
   const transaccionesFiltradas = useMemo(() => {
-    // Tomamos una por txHash, preferimos la que tenga “más info” (creada tiene título)
     const mapa = new Map<string, Actividad>();
     for (const a of actividadFiltrada) {
       const existente = mapa.get(a.txHash);
@@ -413,7 +407,7 @@ export default function PaginaExplorador() {
 
   const totalPaginasTx = useMemo(
     () => Math.max(1, Math.ceil(transaccionesFiltradas.length / TAM_PAGINA)),
-    [transaccionesFiltradas.length],
+    [transaccionesFiltradas.length, TAM_PAGINA],
   );
 
   const paginaTxSegura = useMemo(() => Math.min(Math.max(paginaTx, 1), totalPaginasTx), [paginaTx, totalPaginasTx]);
@@ -421,7 +415,7 @@ export default function PaginaExplorador() {
   const txPagina = useMemo(() => {
     const ini = (paginaTxSegura - 1) * TAM_PAGINA;
     return transaccionesFiltradas.slice(ini, ini + TAM_PAGINA);
-  }, [transaccionesFiltradas, paginaTxSegura]);
+  }, [transaccionesFiltradas, paginaTxSegura, TAM_PAGINA]);
 
   // ---- UI helpers ----
   const tarjetaEstado = useMemo(() => {
@@ -450,9 +444,7 @@ export default function PaginaExplorador() {
 
               {contractAddress ? (
                 <>
-                  <span className="badge badge-primary badge-outline">
-                    Contrato: {acortarDireccion(contractAddress)}
-                  </span>
+                  <span className="badge badge-primary badge-outline">Contrato: {acortarDireccion(contractAddress)}</span>
                   <button className="btn btn-xs btn-ghost" onClick={() => copiarAlPortapapeles(contractAddress)}>
                     Copiar
                   </button>
@@ -471,9 +463,8 @@ export default function PaginaExplorador() {
                 <span className="badge badge-warning">Contrato no detectado</span>
               )}
 
-              <span className="badge badge-ghost">
-                Cargados: {Math.min(actividad.length, MAX_EVENTOS_CARGA)} eventos
-              </span>
+              <span className="badge badge-ghost">Mostrando: {actividad.length} eventos</span>
+              <span className="badge badge-ghost">Rango logs: últimos {BLOQUES_LOGS_RECIENTES.toString()} bloques</span>
               <span className="badge badge-ghost">Página: {TAM_PAGINA}</span>
             </div>
 
@@ -499,11 +490,7 @@ export default function PaginaExplorador() {
           </div>
 
           <div className="flex flex-col gap-2 md:items-end">
-            <button
-              className={`btn ${cargando ? "btn-disabled" : "btn-primary"}`}
-              onClick={recargar}
-              disabled={cargando}
-            >
+            <button className={`btn ${cargando ? "btn-disabled" : "btn-primary"}`} onClick={recargar} disabled={cargando}>
               {cargando ? (
                 <>
                   <span className="loading loading-spinner loading-xs" /> Recargando…
@@ -526,8 +513,8 @@ export default function PaginaExplorador() {
       {!tieneContracto && !cargandoContrato && (
         <div className="mt-6 alert alert-warning">
           <span>
-            No se encontró <b>VotacionUniversitaria</b> en <b>deployedContracts.ts</b> para la red actual. Deploya en
-            esta red y recarga.
+            No se encontró <b>VotacionUniversitaria</b> en <b>deployedContracts.ts</b> para la red actual. Deploya en esta
+            red y recarga.
           </span>
         </div>
       )}
@@ -535,10 +522,7 @@ export default function PaginaExplorador() {
       {/* Tabs */}
       <div className="mt-6">
         <div className="tabs tabs-boxed">
-          <button
-            className={`tab ${pestana === "actividad" ? "tab-active" : ""}`}
-            onClick={() => setPestana("actividad")}
-          >
+          <button className={`tab ${pestana === "actividad" ? "tab-active" : ""}`} onClick={() => setPestana("actividad")}>
             Actividad <span className="ml-2 badge badge-ghost">{actividadFiltrada.length}</span>
           </button>
           <button
@@ -665,13 +649,7 @@ export default function PaginaExplorador() {
                   <span className="label-text">Contrato</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    className="toggle toggle-primary"
-                    checked={soloConMiContrato}
-                    onChange={e => setSoloConMiContrato(e.target.checked)}
-                    disabled
-                  />
+                  <input type="checkbox" className="toggle toggle-primary" checked={soloConMiContrato} disabled />
                   <span className="text-sm opacity-70">Solo este contrato</span>
                 </div>
               </label>
@@ -685,9 +663,7 @@ export default function PaginaExplorador() {
                       : "Voto emitido"}
                 </span>
                 {idVotacionFiltro.trim() && (
-                  <span
-                    className={`badge ${esNumeroEnteroPositivo(idVotacionFiltro.trim()) ? "badge-ghost" : "badge-error"}`}
-                  >
+                  <span className={`badge ${esNumeroEnteroPositivo(idVotacionFiltro.trim()) ? "badge-ghost" : "badge-error"}`}>
                     ID: {idVotacionFiltro.trim()}
                   </span>
                 )}
@@ -711,11 +687,10 @@ export default function PaginaExplorador() {
                 <div>
                   <h2 className="card-title">Actividad del contrato (eventos)</h2>
                   <p className="text-sm opacity-70">
-                    Historial on-chain de <b>VotacionCreada</b> y <b>VotoEmitido</b>. Paginado (25 por página).
+                    Vista reciente on-chain de <b>VotacionCreada</b> y <b>VotoEmitido</b>. (Optimizado: solo últimos {MAX_EVENTOS_MOSTRAR})
                   </p>
                 </div>
 
-                {/* Paginador top */}
                 <Paginador
                   pagina={paginaActividadSegura}
                   totalPaginas={totalPaginasActividad}
@@ -752,9 +727,7 @@ export default function PaginaExplorador() {
                       actividadPagina.map((a, i) => (
                         <tr key={`${a.txHash}-${i}`}>
                           <td>
-                            <span
-                              className={`badge ${a.tipo === "VotacionCreada" ? "badge-primary" : "badge-secondary"}`}
-                            >
+                            <span className={`badge ${a.tipo === "VotacionCreada" ? "badge-primary" : "badge-secondary"}`}>
                               {a.tipo === "VotacionCreada" ? "Votación creada" : "Voto emitido"}
                             </span>
                           </td>
@@ -763,12 +736,7 @@ export default function PaginaExplorador() {
 
                           <td className="font-mono">
                             {explorerBase ? (
-                              <a
-                                className="link"
-                                href={construirLink(explorerBase, "block", a.bloque)}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
+                              <a className="link" href={construirLink(explorerBase, "block", a.bloque)} target="_blank" rel="noreferrer">
                                 {a.bloque.toString()}
                               </a>
                             ) : (
@@ -779,22 +747,13 @@ export default function PaginaExplorador() {
                           <td className="font-mono">
                             <div className="flex items-center gap-2">
                               {explorerBase ? (
-                                <a
-                                  className="link"
-                                  href={construirLink(explorerBase, "tx", a.txHash)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
+                                <a className="link" href={construirLink(explorerBase, "tx", a.txHash)} target="_blank" rel="noreferrer">
                                   {acortarHash(a.txHash)}
                                 </a>
                               ) : (
                                 <span>{acortarHash(a.txHash)}</span>
                               )}
-                              <button
-                                className="btn btn-ghost btn-xs"
-                                onClick={() => copiarAlPortapapeles(a.txHash)}
-                                type="button"
-                              >
+                              <button className="btn btn-ghost btn-xs" onClick={() => copiarAlPortapapeles(a.txHash)} type="button">
                                 Copiar
                               </button>
                             </div>
@@ -805,14 +764,10 @@ export default function PaginaExplorador() {
                               <div className="text-sm">
                                 <div className="flex items-center gap-2 flex-wrap">
                                   <span className="badge badge-ghost">ID: {a.idVotacion?.toString() ?? "—"}</span>
-                                  <span className="badge badge-ghost">
-                                    Opciones: {a.cantidadOpciones?.toString() ?? "—"}
-                                  </span>
+                                  <span className="badge badge-ghost">Opciones: {a.cantidadOpciones?.toString() ?? "—"}</span>
                                   <span className="badge badge-ghost">Creador: {acortarDireccion(a.creador)}</span>
                                   {a.fechaFin && (
-                                    <span className="badge badge-ghost">
-                                      Fin: {new Date(Number(a.fechaFin) * 1000).toLocaleString()}
-                                    </span>
+                                    <span className="badge badge-ghost">Fin: {new Date(Number(a.fechaFin) * 1000).toLocaleString()}</span>
                                   )}
                                 </div>
                                 <div className="mt-2 font-semibold break-words">{a.titulo ?? "—"}</div>
@@ -836,7 +791,6 @@ export default function PaginaExplorador() {
                 </table>
               </div>
 
-              {/* Paginador bottom */}
               <div className="mt-4 flex justify-end">
                 <Paginador
                   pagina={paginaActividadSegura}
@@ -847,7 +801,7 @@ export default function PaginaExplorador() {
               </div>
 
               <div className="text-xs opacity-70 mt-3">
-                Tip para defensa: “Esta pantalla permite auditar todo lo que pasó en el contrato (eventos).”
+                Tip para defensa: “Esta pantalla muestra la actividad reciente del contrato (últimos eventos) optimizada para no depender de indexadores.”
               </div>
             </div>
           </div>
@@ -860,17 +814,10 @@ export default function PaginaExplorador() {
               <div className="flex items-start justify-between gap-3 flex-wrap">
                 <div>
                   <h2 className="card-title">Transacciones del contrato</h2>
-                  <p className="text-sm opacity-70">
-                    Tx únicas derivadas de eventos. Paginado (25 por página). Ideal para demo sin indexadores externos.
-                  </p>
+                  <p className="text-sm opacity-70">Tx únicas derivadas de los eventos cargados. (Vista reciente optimizada).</p>
                 </div>
 
-                <Paginador
-                  pagina={paginaTxSegura}
-                  totalPaginas={totalPaginasTx}
-                  onCambiar={setPaginaTx}
-                  deshabilitado={cargando}
-                />
+                <Paginador pagina={paginaTxSegura} totalPaginas={totalPaginasTx} onCambiar={setPaginaTx} deshabilitado={cargando} />
               </div>
 
               <div className="overflow-x-auto mt-4">
@@ -903,22 +850,13 @@ export default function PaginaExplorador() {
                           <td className="font-mono">
                             <div className="flex items-center gap-2">
                               {explorerBase ? (
-                                <a
-                                  className="link"
-                                  href={construirLink(explorerBase, "tx", t.txHash)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
+                                <a className="link" href={construirLink(explorerBase, "tx", t.txHash)} target="_blank" rel="noreferrer">
                                   {acortarHash(t.txHash)}
                                 </a>
                               ) : (
                                 <span>{acortarHash(t.txHash)}</span>
                               )}
-                              <button
-                                className="btn btn-ghost btn-xs"
-                                onClick={() => copiarAlPortapapeles(t.txHash)}
-                                type="button"
-                              >
+                              <button className="btn btn-ghost btn-xs" onClick={() => copiarAlPortapapeles(t.txHash)} type="button">
                                 Copiar
                               </button>
                             </div>
@@ -926,12 +864,7 @@ export default function PaginaExplorador() {
 
                           <td className="font-mono">
                             {explorerBase ? (
-                              <a
-                                className="link"
-                                href={construirLink(explorerBase, "block", t.bloque)}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
+                              <a className="link" href={construirLink(explorerBase, "block", t.bloque)} target="_blank" rel="noreferrer">
                                 {t.bloque.toString()}
                               </a>
                             ) : (
@@ -942,19 +875,13 @@ export default function PaginaExplorador() {
                           <td className="font-mono text-xs">{tiempoHace(t.timestamp)}</td>
 
                           <td>
-                            <span
-                              className={`badge ${t.tipo === "VotacionCreada" ? "badge-primary" : "badge-secondary"}`}
-                            >
+                            <span className={`badge ${t.tipo === "VotacionCreada" ? "badge-primary" : "badge-secondary"}`}>
                               {t.tipo === "VotacionCreada" ? "Crear votación" : "Votar"}
                             </span>
                           </td>
 
                           <td className="text-sm">
-                            {t.idVotacion !== undefined ? (
-                              <span className="badge badge-ghost">ID: {t.idVotacion.toString()}</span>
-                            ) : (
-                              <span className="opacity-70">—</span>
-                            )}
+                            {t.idVotacion !== undefined ? <span className="badge badge-ghost">ID: {t.idVotacion.toString()}</span> : <span className="opacity-70">—</span>}
                           </td>
                         </tr>
                       ))
@@ -964,17 +891,10 @@ export default function PaginaExplorador() {
               </div>
 
               <div className="mt-4 flex justify-end">
-                <Paginador
-                  pagina={paginaTxSegura}
-                  totalPaginas={totalPaginasTx}
-                  onCambiar={setPaginaTx}
-                  deshabilitado={cargando}
-                />
+                <Paginador pagina={paginaTxSegura} totalPaginas={totalPaginasTx} onCambiar={setPaginaTx} deshabilitado={cargando} />
               </div>
 
-              <div className="text-xs opacity-70 mt-3">
-                Nota: esto es un “explorador focalizado” para tu dApp. En Sepolia, puedes validar con links reales.
-              </div>
+              <div className="text-xs opacity-70 mt-3">Nota: vista reciente para demo estable en Sepolia.</div>
             </div>
           </div>
         )}
@@ -986,9 +906,7 @@ export default function PaginaExplorador() {
               <div className="flex items-start justify-between gap-3 flex-wrap">
                 <div>
                   <h2 className="card-title">Bloques recientes</h2>
-                  <p className="text-sm opacity-70">
-                    Últimos bloques de la red actual. (Vista tipo explorer, versión simple).
-                  </p>
+                  <p className="text-sm opacity-70">Últimos bloques de la red actual. (Vista tipo explorer, versión simple).</p>
                 </div>
               </div>
 
@@ -1015,12 +933,7 @@ export default function PaginaExplorador() {
                         <tr key={b.hash}>
                           <td className="font-mono">
                             {explorerBase ? (
-                              <a
-                                className="link"
-                                href={construirLink(explorerBase, "block", b.number)}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
+                              <a className="link" href={construirLink(explorerBase, "block", b.number)} target="_blank" rel="noreferrer">
                                 {String(b.number)}
                               </a>
                             ) : (
@@ -1030,9 +943,7 @@ export default function PaginaExplorador() {
                           <td className="font-mono text-xs">{tiempoHace(Number(b.timestamp ?? 0n))}</td>
                           <td className="font-mono">{acortarDireccion(b.miner)}</td>
                           <td>{b.transactions?.length ?? "—"}</td>
-                          <td className="font-mono text-xs">
-                            {b.baseFeePerGas ? `${b.baseFeePerGas.toString()} wei` : "—"}
-                          </td>
+                          <td className="font-mono text-xs">{b.baseFeePerGas ? `${b.baseFeePerGas.toString()} wei` : "—"}</td>
                         </tr>
                       ))
                     )}
@@ -1040,9 +951,7 @@ export default function PaginaExplorador() {
                 </table>
               </div>
 
-              <div className="text-xs opacity-70 mt-3">
-                En Hardhat local, el “miner” puede verse distinto. En Sepolia se parece más al explorer real.
-              </div>
+              <div className="text-xs opacity-70 mt-3">En Hardhat local, el “miner” puede verse distinto. En Sepolia se parece más al explorer real.</div>
             </div>
           </div>
         )}
@@ -1066,7 +975,6 @@ function Paginador({
   const puedeAtras = pagina > 1;
   const puedeAdelante = pagina < totalPaginas;
 
-  // Ventana de páginas (1 … n)
   const paginas = useMemo(() => {
     const w = 5;
     const inicio = Math.max(1, pagina - Math.floor(w / 2));
@@ -1080,13 +988,7 @@ function Paginador({
 
   return (
     <div className="join">
-      <button
-        className="btn btn-sm join-item"
-        onClick={() => onCambiar(1)}
-        disabled={!puedeAtras || deshabilitado}
-        type="button"
-        title="Primera"
-      >
+      <button className="btn btn-sm join-item" onClick={() => onCambiar(1)} disabled={!puedeAtras || deshabilitado} type="button" title="Primera">
         «
       </button>
       <button
@@ -1101,12 +1003,7 @@ function Paginador({
 
       {paginas[0] !== 1 && (
         <>
-          <button
-            className="btn btn-sm join-item btn-ghost"
-            onClick={() => onCambiar(1)}
-            disabled={deshabilitado}
-            type="button"
-          >
+          <button className="btn btn-sm join-item btn-ghost" onClick={() => onCambiar(1)} disabled={deshabilitado} type="button">
             1
           </button>
           <button className="btn btn-sm join-item btn-ghost pointer-events-none" type="button">
@@ -1132,12 +1029,7 @@ function Paginador({
           <button className="btn btn-sm join-item btn-ghost pointer-events-none" type="button">
             …
           </button>
-          <button
-            className="btn btn-sm join-item btn-ghost"
-            onClick={() => onCambiar(totalPaginas)}
-            disabled={deshabilitado}
-            type="button"
-          >
+          <button className="btn btn-sm join-item btn-ghost" onClick={() => onCambiar(totalPaginas)} disabled={deshabilitado} type="button">
             {totalPaginas}
           </button>
         </>
