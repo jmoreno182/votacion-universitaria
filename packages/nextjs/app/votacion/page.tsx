@@ -1,1035 +1,249 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { type Hex, parseAbiItem } from "viem";
-import { usePublicClient } from "wagmi";
-import { useDeployedContractInfo, useScaffoldReadContract } from "~~/hooks/scaffold-eth";
-import { useTargetNetwork } from "~~/hooks/scaffold-eth/useTargetNetwork";
+import { useAccount } from "wagmi";
+import { useScaffoldReadContract, useScaffoldWriteContract } from "~~/hooks/scaffold-eth";
 import { notification } from "~~/utils/scaffold-eth";
 
-/**
- * app/explorador/page.tsx
- * Mini “Etherscan” para el contrato (Hardhat → Sepolia)
- * - Tabs: Actividad (eventos), Transacciones, Bloques
- * - Filtros pro (tipo, búsqueda, idVotacion)
- * - Paginación
- * - Links a explorer en Sepolia
- *
- * ✅ Optimización anti-límites RPC:
- * - NO escanea desde despliegue → latest (rango enorme)
- * - Solo consulta logs en los últimos N bloques
- * - Solo muestra los últimos 10 eventos (y timestamps solo para esos)
- */
-
-type Pestaña = "actividad" | "transacciones" | "bloques";
-type TipoActividad = "todas" | "VotacionCreada" | "VotoEmitido";
-
-type Actividad = {
-  tipo: "VotacionCreada" | "VotoEmitido";
-  bloque: bigint;
-  txHash: Hex;
-  timestamp?: number;
-
-  // Datos comunes
-  idVotacion?: bigint;
-
-  // VotacionCreada
-  creador?: `0x${string}`;
-  titulo?: string;
-  fechaFin?: bigint;
-  cantidadOpciones?: bigint;
-
-  // VotoEmitido
-  votante?: `0x${string}`;
-  idOpcion?: bigint;
-};
-
-function acortarHash(hash?: string, start = 10, end = 8) {
-  if (!hash) return "—";
-  if (hash.length <= start + end) return hash;
-  return `${hash.slice(0, start)}…${hash.slice(-end)}`;
-}
+type FiltroEstado = "todas" | "activas" | "cerradas";
+type Orden = "recientes" | "antiguas";
 
 function acortarDireccion(dir?: string) {
-  if (!dir) return "—";
-  return `${dir.slice(0, 6)}…${dir.slice(-4)}`;
+  if (!dir) return "No conectado";
+  return `${dir.slice(0, 6)}...${dir.slice(-4)}`;
 }
 
-function tiempoHace(segundosEpoch?: number) {
-  if (!segundosEpoch) return "—";
-  const ahora = Math.floor(Date.now() / 1000);
-  const diff = Math.max(ahora - segundosEpoch, 0);
-
-  if (diff < 10) return "hace unos segundos";
-  if (diff < 60) return `hace ${diff}s`;
-  const min = Math.floor(diff / 60);
-  if (min < 60) return `hace ${min}m`;
-  const h = Math.floor(min / 60);
-  if (h < 24) return `hace ${h}h`;
-  const d = Math.floor(h / 24);
-  return `hace ${d}d`;
+function ahoraSegundos() {
+  return Math.floor(Date.now() / 1000);
 }
 
-function copiarAlPortapapeles(texto: string) {
-  const clipboard = typeof navigator !== "undefined" ? navigator.clipboard : undefined;
+function formatearRestante(segundos: number) {
+  const s = Math.max(segundos, 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
 
-  if (clipboard?.writeText) {
-    clipboard
-      .writeText(texto)
-      .then(() => notification.success("Copiado"))
-      .catch(() => {
-        if (copiarFallback(texto)) notification.success("Copiado");
-        else notification.error("No se pudo copiar");
-      });
-    return;
-  }
-
-  if (copiarFallback(texto)) notification.success("Copiado");
-  else notification.error("No se pudo copiar");
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
 }
 
-function copiarFallback(texto: string) {
-  try {
-    const textarea = document.createElement("textarea");
-    textarea.value = texto;
-    textarea.setAttribute("readonly", "true");
-    textarea.style.position = "fixed";
-    textarea.style.top = "-1000px";
-    textarea.style.left = "-1000px";
-
-    document.body.appendChild(textarea);
-    textarea.select();
-
-    const ok = document.execCommand("copy");
-    document.body.removeChild(textarea);
-
-    return ok;
-  } catch {
-    return false;
-  }
+function bigintANumeroSeguro(v: bigint) {
+  // Para este caso (demo universitaria) los votos serán pequeños.
+  // Si algún día esperas números enormes, lo tratamos distinto.
+  return Number(v);
 }
 
-function construirLink(explorerBase?: string, tipo?: "tx" | "block" | "address", valor?: string | number | bigint) {
-  if (!explorerBase || !tipo || valor === undefined || valor === null) return undefined;
-  const base = explorerBase.endsWith("/") ? explorerBase.slice(0, -1) : explorerBase;
-
-  if (tipo === "tx") return `${base}/tx/${String(valor)}`;
-  if (tipo === "block") return `${base}/block/${String(valor)}`;
-  return `${base}/address/${String(valor)}`;
+function sumarBigints(mapa: Record<number, bigint>) {
+  let total = 0n;
+  for (const v of Object.values(mapa)) total += v;
+  return total;
 }
 
-function claseBadgeEstado(tipo: TipoActividad) {
-  if (tipo === "VotacionCreada") return "badge-primary";
-  if (tipo === "VotoEmitido") return "badge-secondary";
-  return "badge-ghost";
-}
+export default function PaginaVotacion() {
+  const { address, isConnected } = useAccount();
 
-function normalizarTexto(s: string) {
-  return s.trim().toLowerCase();
-}
-
-function esNumeroEnteroPositivo(s: string) {
-  if (!s) return false;
-  const n = Number(s);
-  return Number.isInteger(n) && n >= 0;
-}
-
-export default function PaginaExplorador() {
-  // ✅ UI: puedes dejar paginación, pero con 10 eventos realmente será 1 página
-  const TAM_PAGINA = 25;
-
-  // ✅ Anti-límites RPC:
-  const MAX_EVENTOS_MOSTRAR = 10; // SOLO 10 eventos
-  const BLOQUES_LOGS_RECIENTES = 5_000n; // solo últimos 5000 bloques (ajusta 2000–20000)
-
-  const { targetNetwork } = useTargetNetwork();
-  const explorerBase = (targetNetwork as any)?.blockExplorerUrl as string | undefined;
-
-  const publicClient = usePublicClient();
-  const { data: deployedContractData, isLoading: cargandoContrato } = useDeployedContractInfo({
+  // Total
+  const { data: totalVotaciones } = useScaffoldReadContract({
     contractName: "VotacionUniversitaria",
+    functionName: "contadorVotaciones",
   });
 
-  const contractAddress = deployedContractData?.address as `0x${string}` | undefined;
-
-  // (lo dejamos por compatibilidad, pero ya no usamos from=despliegue→latest)
-  const { data: bloqueDespliegue } = useScaffoldReadContract({
+  // Owner del contrato
+  const { data: owner } = useScaffoldReadContract({
     contractName: "VotacionUniversitaria",
-    functionName: "bloqueDespliegue",
+    functionName: "owner",
   });
 
-  // UI state
-  const [pestana, setPestana] = useState<Pestaña>("actividad");
+  const esOwner = useMemo(() => {
+    if (!address || !owner) return false;
+    return address.toLowerCase() === owner.toLowerCase();
+  }, [address, owner]);
 
-  // Filtros pro
-  const [tipoFiltro, setTipoFiltro] = useState<TipoActividad>("todas");
+  // UI controls
   const [busqueda, setBusqueda] = useState("");
-  const [idVotacionFiltro, setIdVotacionFiltro] = useState("");
-  const [soloConMiContrato] = useState(true);
+  const [filtroEstado, setFiltroEstado] = useState<FiltroEstado>("todas");
+  const [orden, setOrden] = useState<Orden>("recientes");
 
-  const [ordenDesc, setOrdenDesc] = useState(true);
-
-  // Paginación
-  const [paginaActividad, setPaginaActividad] = useState(1);
-  const [paginaTx, setPaginaTx] = useState(1);
-
-  // Data state
-  const [cargando, setCargando] = useState(false);
-  const [actividad, setActividad] = useState<Actividad[]>([]);
-  const [bloques, setBloques] = useState<any[]>([]);
-
-  const eventoVotacionCreada = useMemo(
-    () =>
-      parseAbiItem(
-        "event VotacionCreada(uint256 indexed idVotacion, address indexed creador, string titulo, uint256 fechaFin, uint256 cantidadOpciones)",
-      ),
-    [],
-  );
-
-  const eventoVotoEmitido = useMemo(
-    () => parseAbiItem("event VotoEmitido(uint256 indexed idVotacion, address indexed votante, uint256 idOpcion)"),
-    [],
-  );
-
-  // Reset paginación cuando cambian filtros relevantes
-  useEffect(() => setPaginaActividad(1), [tipoFiltro, busqueda, idVotacionFiltro, ordenDesc]);
-  useEffect(() => setPaginaTx(1), [busqueda, idVotacionFiltro, ordenDesc]);
-
-  const recargar = useCallback(async () => {
-    if (!publicClient || !contractAddress) return;
-
-    setCargando(true);
-    try {
-      // ✅ Rango seguro: últimos N bloques
-      const ultimoBloque = await publicClient.getBlockNumber();
-
-      const desdePorRango = ultimoBloque > BLOQUES_LOGS_RECIENTES ? ultimoBloque - BLOQUES_LOGS_RECIENTES : 0n;
-
-      // ✅ Si tienes bloqueDespliegue, lo respetamos solo si es más reciente que el rango (evita irte muy atrás)
-      const desdeDeploy = BigInt(bloqueDespliegue ?? 0n);
-      const desde = desdeDeploy > desdePorRango ? desdeDeploy : desdePorRango;
-
-      // 1) Logs (dos tipos) SOLO en rango pequeño
-      const [logsCreada, logsVoto] = await Promise.all([
-        publicClient.getLogs({
-          address: contractAddress,
-          event: eventoVotacionCreada,
-          fromBlock: desde,
-          toBlock: ultimoBloque,
-        }),
-        publicClient.getLogs({
-          address: contractAddress,
-          event: eventoVotoEmitido,
-          fromBlock: desde,
-          toBlock: ultimoBloque,
-        }),
-      ]);
-
-      const combinados: Actividad[] = [];
-
-      for (const l of logsCreada) {
-        const args: any = l.args;
-        combinados.push({
-          tipo: "VotacionCreada",
-          bloque: l.blockNumber!,
-          txHash: l.transactionHash!,
-          idVotacion: args?.idVotacion,
-          creador: args?.creador,
-          titulo: args?.titulo,
-          fechaFin: args?.fechaFin,
-          cantidadOpciones: args?.cantidadOpciones,
-        });
-      }
-
-      for (const l of logsVoto) {
-        const args: any = l.args;
-        combinados.push({
-          tipo: "VotoEmitido",
-          bloque: l.blockNumber!,
-          txHash: l.transactionHash!,
-          idVotacion: args?.idVotacion,
-          votante: args?.votante,
-          idOpcion: args?.idOpcion,
-        });
-      }
-
-      // Orden base por bloque (desc) y toma SOLO los últimos 10
-      combinados.sort((a, b) => {
-        if (a.bloque === b.bloque) return a.txHash.localeCompare(b.txHash);
-        return Number(b.bloque - a.bloque);
-      });
-
-      const ultimos = combinados.slice(0, MAX_EVENTOS_MOSTRAR);
-
-      // 2) Timestamps SOLO para esos 10 eventos (máx 10 bloques únicos)
-      const bloquesUnicos = Array.from(new Set(ultimos.map(x => x.bloque.toString()))).map(x => BigInt(x));
-      const mapaTs = new Map<string, number>();
-
-      // ✅ Secuencial (evita bursts de requests)
-      for (const bn of bloquesUnicos) {
-        try {
-          const b = await publicClient.getBlock({ blockNumber: bn });
-          mapaTs.set(bn.toString(), Number((b as any).timestamp ?? 0n));
-        } catch {
-          // ignore
-        }
-      }
-
-      const conTiempo = ultimos.map(x => ({ ...x, timestamp: mapaTs.get(x.bloque.toString()) }));
-      setActividad(conTiempo);
-
-      // 3) Bloques recientes (10)
-      const cantidadBloques = 10;
-      const lista: any[] = [];
-      for (let i = 0; i < cantidadBloques; i++) {
-        const bn = ultimoBloque - BigInt(i);
-        if (bn < 0n) break;
-        try {
-          const b = await publicClient.getBlock({ blockNumber: bn });
-          lista.push(b);
-        } catch {
-          // ignore
-        }
-      }
-      setBloques(lista);
-    } catch (e: any) {
-      notification.error(e?.shortMessage ?? e?.message ?? "Error cargando datos del explorador");
-    } finally {
-      setCargando(false);
-    }
-  }, [
-    publicClient,
-    contractAddress,
-    bloqueDespliegue,
-    eventoVotacionCreada,
-    eventoVotoEmitido,
-    BLOQUES_LOGS_RECIENTES,
-    MAX_EVENTOS_MOSTRAR,
-  ]);
+  // ✅ Escalabilidad: "Cargar más"
+  const [cantidadVisible, setCantidadVisible] = useState(8);
+  const pasoCarga = 8;
 
   useEffect(() => {
-    if (!publicClient || !contractAddress) return;
-    recargar();
-  }, [publicClient, contractAddress, recargar]);
+    // Cuando cambias filtros/orden/búsqueda, volvemos a mostrar menos para mejor UX.
+    setCantidadVisible(8);
+  }, [busqueda, filtroEstado, orden]);
 
-  // ---- Derivados: conteos ----
-  const conteos = useMemo(() => {
-    const total = actividad.length;
-    const creadas = actividad.filter(a => a.tipo === "VotacionCreada").length;
-    const votos = actividad.filter(a => a.tipo === "VotoEmitido").length;
-    const txs = new Set(actividad.map(a => a.txHash)).size;
-    return { total, creadas, votos, txs };
-  }, [actividad]);
+  const idsOrdenados = useMemo(() => {
+    const total = Number(totalVotaciones ?? 0n);
+    const base = Array.from({ length: total }, (_, i) => i);
+    return orden === "recientes" ? base.reverse() : base;
+  }, [totalVotaciones, orden]);
 
-  // ---- Filtros pro sobre Actividad ----
-  const actividadFiltrada = useMemo(() => {
-    let lista = [...actividad];
-
-    if (!soloConMiContrato) {
-      // no-op (placeholder)
-    }
-
-    if (tipoFiltro !== "todas") {
-      lista = lista.filter(a => a.tipo === tipoFiltro);
-    }
-
-    const idTxt = idVotacionFiltro.trim();
-    if (idTxt) {
-      if (esNumeroEnteroPositivo(idTxt)) {
-        const id = BigInt(Number(idTxt));
-        lista = lista.filter(a => a.idVotacion === id);
-      } else {
-        lista = [];
-      }
-    }
-
-    const q = normalizarTexto(busqueda);
-    if (q) {
-      lista = lista.filter(a => {
-        const campos: string[] = [
-          a.txHash,
-          a.titulo ?? "",
-          a.creador ?? "",
-          a.votante ?? "",
-          a.idVotacion?.toString() ?? "",
-          a.idOpcion?.toString() ?? "",
-          a.bloque.toString(),
-        ];
-        return campos.some(c => normalizarTexto(String(c)).includes(q));
-      });
-    }
-
-    lista.sort((a, b) => {
-      if (a.bloque === b.bloque) return a.txHash.localeCompare(b.txHash);
-      return ordenDesc ? Number(b.bloque - a.bloque) : Number(a.bloque - b.bloque);
-    });
-
-    return lista;
-  }, [actividad, tipoFiltro, busqueda, idVotacionFiltro, ordenDesc, soloConMiContrato]);
-
-  // ---- Paginación Actividad ----
-  const totalPaginasActividad = useMemo(
-    () => Math.max(1, Math.ceil(actividadFiltrada.length / TAM_PAGINA)),
-    [actividadFiltrada.length, TAM_PAGINA],
-  );
-
-  const paginaActividadSegura = useMemo(
-    () => Math.min(Math.max(paginaActividad, 1), totalPaginasActividad),
-    [paginaActividad, totalPaginasActividad],
-  );
-
-  const actividadPagina = useMemo(() => {
-    const ini = (paginaActividadSegura - 1) * TAM_PAGINA;
-    return actividadFiltrada.slice(ini, ini + TAM_PAGINA);
-  }, [actividadFiltrada, paginaActividadSegura, TAM_PAGINA]);
-
-  // ---- Transacciones derivadas (únicas por txHash) + filtros + paginación ----
-  const transaccionesFiltradas = useMemo(() => {
-    const mapa = new Map<string, Actividad>();
-    for (const a of actividadFiltrada) {
-      const existente = mapa.get(a.txHash);
-      if (!existente) {
-        mapa.set(a.txHash, a);
-        continue;
-      }
-      if (existente.tipo === "VotoEmitido" && a.tipo === "VotacionCreada") {
-        mapa.set(a.txHash, a);
-      }
-    }
-    const lista = Array.from(mapa.values());
-
-    lista.sort((a, b) => {
-      if (a.bloque === b.bloque) return a.txHash.localeCompare(b.txHash);
-      return ordenDesc ? Number(b.bloque - a.bloque) : Number(a.bloque - b.bloque);
-    });
-
-    return lista;
-  }, [actividadFiltrada, ordenDesc]);
-
-  const totalPaginasTx = useMemo(
-    () => Math.max(1, Math.ceil(transaccionesFiltradas.length / TAM_PAGINA)),
-    [transaccionesFiltradas.length, TAM_PAGINA],
-  );
-
-  const paginaTxSegura = useMemo(() => Math.min(Math.max(paginaTx, 1), totalPaginasTx), [paginaTx, totalPaginasTx]);
-
-  const txPagina = useMemo(() => {
-    const ini = (paginaTxSegura - 1) * TAM_PAGINA;
-    return transaccionesFiltradas.slice(ini, ini + TAM_PAGINA);
-  }, [transaccionesFiltradas, paginaTxSegura, TAM_PAGINA]);
-
-  // ---- UI helpers ----
-  const tarjetaEstado = useMemo(() => {
-    if (cargando) return { texto: "Actualizando…", clase: "badge-warning" };
-    return { texto: "Actualizado", clase: "badge-success" };
-  }, [cargando]);
-
-  const tieneContracto = !!contractAddress;
+  const idsParaRender = useMemo(() => {
+    return idsOrdenados.slice(0, cantidadVisible);
+  }, [idsOrdenados, cantidadVisible]);
 
   return (
-    <div className="p-6 max-w-8xl mx-auto">
-      {/* HERO / HEADER */}
-      <div className="bg-base-200 border border-base-300 rounded-2xl p-5">
-        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-3xl font-bold">Explorador del contrato</h1>
-              <span className="badge badge-outline">Estilo Etherscan</span>
-              <span className={`badge ${tarjetaEstado.clase}`}>{tarjetaEstado.texto}</span>
-            </div>
-
-            <div className="mt-3 flex flex-wrap gap-2 items-center">
-              <span className="badge badge-neutral">
-                Red: {targetNetwork?.name ?? "—"} ({targetNetwork?.id ?? "—"})
-              </span>
-
-              {contractAddress ? (
-                <>
-                  <span className="badge badge-primary badge-outline">
-                    Contrato: {acortarDireccion(contractAddress)}
-                  </span>
-                  <button className="btn btn-xs btn-ghost" onClick={() => copiarAlPortapapeles(contractAddress)}>
-                    Copiar
-                  </button>
-                  {explorerBase && (
-                    <a
-                      className="btn btn-xs btn-outline"
-                      href={construirLink(explorerBase, "address", contractAddress)}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Ver en Explorer
-                    </a>
-                  )}
-                </>
-              ) : (
-                <span className="badge badge-warning">Contrato no detectado</span>
-              )}
-
-              <span className="badge badge-ghost">Mostrando: {actividad.length} eventos</span>
-              <span className="badge badge-ghost">Rango logs: últimos {BLOQUES_LOGS_RECIENTES.toString()} bloques</span>
-              <span className="badge badge-ghost">Página: {TAM_PAGINA}</span>
-            </div>
-
-            {/* KPIs rápidos */}
-            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2">
-              <div className="stat bg-base-100 border border-base-300 rounded-xl p-3">
-                <div className="stat-title">Eventos</div>
-                <div className="stat-value text-2xl">{conteos.total}</div>
-              </div>
-              <div className="stat bg-base-100 border border-base-300 rounded-xl p-3">
-                <div className="stat-title">Votaciones creadas</div>
-                <div className="stat-value text-2xl">{conteos.creadas}</div>
-              </div>
-              <div className="stat bg-base-100 border border-base-300 rounded-xl p-3">
-                <div className="stat-title">Votos emitidos</div>
-                <div className="stat-value text-2xl">{conteos.votos}</div>
-              </div>
-              <div className="stat bg-base-100 border border-base-300 rounded-xl p-3">
-                <div className="stat-title">Tx únicas</div>
-                <div className="stat-value text-2xl">{conteos.txs}</div>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-2 md:items-end">
-            <button
-              className={`btn ${cargando ? "btn-disabled" : "btn-primary"}`}
-              onClick={recargar}
-              disabled={cargando}
-            >
-              {cargando ? (
-                <>
-                  <span className="loading loading-spinner loading-xs" /> Recargando…
-                </>
-              ) : (
-                "Recargar"
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Estados base */}
-      {cargandoContrato && (
-        <div className="mt-6">
-          <span className="loading loading-spinner loading-md" /> <span className="opacity-70">Cargando contrato…</span>
-        </div>
-      )}
-
-      {!tieneContracto && !cargandoContrato && (
-        <div className="mt-6 alert alert-warning">
-          <span>
-            No se encontró <b>VotacionUniversitaria</b> en <b>deployedContracts.ts</b> para la red actual. Deploya en
-            esta red y recarga.
-          </span>
-        </div>
-      )}
-
-      {/* Tabs */}
-      <div className="mt-6">
-        <div className="tabs tabs-boxed">
-          <button
-            className={`tab ${pestana === "actividad" ? "tab-active" : ""}`}
-            onClick={() => setPestana("actividad")}
-          >
-            Actividad <span className="ml-2 badge badge-ghost">{actividadFiltrada.length}</span>
-          </button>
-          <button
-            className={`tab ${pestana === "transacciones" ? "tab-active" : ""}`}
-            onClick={() => setPestana("transacciones")}
-          >
-            Transacciones <span className="ml-2 badge badge-ghost">{transaccionesFiltradas.length}</span>
-          </button>
-          <button className={`tab ${pestana === "bloques" ? "tab-active" : ""}`} onClick={() => setPestana("bloques")}>
-            Bloques <span className="ml-2 badge badge-ghost">{bloques.length}</span>
-          </button>
-        </div>
-      </div>
-
-      {/* FILTROS (solo en actividad/tx) */}
-      {(pestana === "actividad" || pestana === "transacciones") && (
-        <div className="mt-4 card bg-base-100 border border-base-300">
-          <div className="card-body p-4">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <h2 className="font-semibold">Filtros</h2>
+    <div className="min-h-screen">
+      {/* HERO */}
+      <div className="bg-base-200 border-b border-base-300">
+        <div className="p-6 max-w-6xl mx-auto">
+          <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+            <div>
               <div className="flex items-center gap-2">
-                <button
-                  className="btn btn-sm btn-ghost"
-                  onClick={() => {
-                    setTipoFiltro("todas");
-                    setBusqueda("");
-                    setIdVotacionFiltro("");
-                    setOrdenDesc(true);
-                  }}
-                  type="button"
-                >
-                  Limpiar filtros
-                </button>
+                <h1 className="text-3xl font-bold">Votación Universitaria</h1>
+                <span className="badge badge-outline">Demo dApp</span>
               </div>
-            </div>
+              <p className="opacity-70 mt-1">
+                Elige una opción, firma la transacción y tu voto queda registrado on-chain.
+              </p>
 
-            <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-              {/* Tipo */}
-              <label className="form-control">
-                <div className="label">
-                  <span className="label-text">Tipo</span>
-                </div>
-                <select
-                  className="select select-bordered"
-                  value={tipoFiltro}
-                  onChange={e => setTipoFiltro(e.target.value as TipoActividad)}
-                  disabled={cargando}
-                >
-                  <option value="todas">Todas</option>
-                  <option value="VotacionCreada">Votación creada</option>
-                  <option value="VotoEmitido">Voto emitido</option>
-                </select>
-              </label>
-
-              {/* ID votación */}
-              <label className="form-control">
-                <div className="label">
-                  <span className="label-text">ID Votación</span>
-                  <span className="label-text-alt opacity-70">Exacto</span>
-                </div>
-                <input
-                  className="input input-bordered"
-                  placeholder="Ej: 0"
-                  value={idVotacionFiltro}
-                  onChange={e => setIdVotacionFiltro(e.target.value)}
-                  disabled={cargando}
-                />
-              </label>
-
-              {/* Búsqueda */}
-              <label className="form-control md:col-span-2">
-                <div className="label">
-                  <span className="label-text">Búsqueda</span>
-                  <span className="label-text-alt opacity-70">Título, txHash, address…</span>
-                </div>
-                <div className="join w-full">
-                  <input
-                    className="input input-bordered join-item w-full"
-                    placeholder="Buscar…"
-                    value={busqueda}
-                    onChange={e => setBusqueda(e.target.value)}
-                    disabled={cargando}
-                  />
-                  {busqueda ? (
-                    <button className="btn join-item" type="button" onClick={() => setBusqueda("")} disabled={cargando}>
-                      ✕
-                    </button>
-                  ) : (
-                    <button className="btn join-item btn-ghost pointer-events-none" type="button">
-                      🔎
-                    </button>
-                  )}
-                </div>
-              </label>
-
-              {/* Orden */}
-              <label className="form-control">
-                <div className="label">
-                  <span className="label-text">Orden</span>
-                </div>
-                <div className="join w-full">
-                  <button
-                    className={`btn join-item w-1/2 ${ordenDesc ? "btn-active" : "btn-ghost"}`}
-                    onClick={() => setOrdenDesc(true)}
-                    type="button"
-                    disabled={cargando}
-                  >
-                    Recientes
-                  </button>
-                  <button
-                    className={`btn join-item w-1/2 ${!ordenDesc ? "btn-active" : "btn-ghost"}`}
-                    onClick={() => setOrdenDesc(false)}
-                    type="button"
-                    disabled={cargando}
-                  >
-                    Antiguas
-                  </button>
-                </div>
-              </label>
-
-              {/* Placeholder toggle (futuro) */}
-              <label className="form-control">
-                <div className="label">
-                  <span className="label-text">Contrato</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input type="checkbox" className="toggle toggle-primary" checked={soloConMiContrato} disabled />
-                  <span className="text-sm opacity-70">Solo este contrato</span>
-                </div>
-              </label>
-
-              <div className="md:col-span-3 flex items-center gap-2 flex-wrap">
-                <span className={`badge ${claseBadgeEstado(tipoFiltro)}`}>
-                  {tipoFiltro === "todas"
-                    ? "Todas"
-                    : tipoFiltro === "VotacionCreada"
-                      ? "Votación creada"
-                      : "Voto emitido"}
+              <div className="mt-3 flex flex-wrap gap-2">
+                <span className="badge badge-neutral">Red: Hardhat (31337)</span>
+                <span className={`badge ${isConnected ? "badge-success" : "badge-warning"}`}>
+                  {isConnected ? "Wallet conectada" : "Conecta tu wallet"}
                 </span>
-                {idVotacionFiltro.trim() && (
-                  <span
-                    className={`badge ${esNumeroEnteroPositivo(idVotacionFiltro.trim()) ? "badge-ghost" : "badge-error"}`}
-                  >
-                    ID: {idVotacionFiltro.trim()}
+                <span className="badge badge-ghost">Total: {totalVotaciones?.toString() ?? "0"}</span>
+                {owner && (
+                  <span className={`badge ${esOwner ? "badge-primary" : "badge-ghost"}`}>
+                    Owner: {acortarDireccion(owner)}
                   </span>
                 )}
-                {busqueda.trim() && <span className="badge badge-ghost">Q: {busqueda.trim()}</span>}
-                <span className="badge badge-neutral">
-                  Resultados: {pestana === "actividad" ? actividadFiltrada.length : transaccionesFiltradas.length}
-                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between md:justify-end gap-3">
+              <div className="text-right">
+                <div className="text-xs opacity-70">Tu cuenta</div>
+                <div className="font-mono text-sm">{acortarDireccion(address)}</div>
+                {isConnected && (
+                  <div className="text-xs opacity-70 mt-1">
+                    Rol:{" "}
+                    <span className={esOwner ? "text-primary font-semibold" : ""}>
+                      {esOwner ? "Owner (admin)" : "Estudiante (votante)"}
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           </div>
+
+          {/* Controles */}
+          <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-3">
+            <label className="input input-bordered flex items-center gap-2">
+              <span className="opacity-60">🔎</span>
+              <input
+                className="grow"
+                placeholder="Buscar por título…"
+                value={busqueda}
+                onChange={e => setBusqueda(e.target.value)}
+              />
+              {busqueda && (
+                <button className="btn btn-ghost btn-xs" onClick={() => setBusqueda("")}>
+                  Limpiar
+                </button>
+              )}
+            </label>
+
+            <div className="join w-full">
+              <button
+                className={`btn join-item w-1/3 ${filtroEstado === "todas" ? "btn-active" : "btn-ghost"}`}
+                onClick={() => setFiltroEstado("todas")}
+              >
+                Todas
+              </button>
+              <button
+                className={`btn join-item w-1/3 ${filtroEstado === "activas" ? "btn-active" : "btn-ghost"}`}
+                onClick={() => setFiltroEstado("activas")}
+              >
+                Activas
+              </button>
+              <button
+                className={`btn join-item w-1/3 ${filtroEstado === "cerradas" ? "btn-active" : "btn-ghost"}`}
+                onClick={() => setFiltroEstado("cerradas")}
+              >
+                Cerradas
+              </button>
+            </div>
+
+            <div className="join w-full md:justify-self-end md:w-auto">
+              <button
+                className={`btn join-item ${orden === "recientes" ? "btn-active" : "btn-ghost"}`}
+                onClick={() => setOrden("recientes")}
+              >
+                Más recientes
+              </button>
+              <button
+                className={`btn join-item ${orden === "antiguas" ? "btn-active" : "btn-ghost"}`}
+                onClick={() => setOrden("antiguas")}
+              >
+                Más antiguas
+              </button>
+            </div>
+          </div>
+
+          {/* FORMULARIO (solo owner) */}
+          {esOwner && <FormularioCrearVotacion />}
         </div>
-      )}
+      </div>
 
-      {/* CONTENIDO */}
-      <div className="mt-4">
-        {/* ACTIVIDAD */}
-        {pestana === "actividad" && (
-          <div className="card bg-base-100 border border-base-300">
-            <div className="card-body">
-              <div className="flex items-start justify-between gap-3 flex-wrap">
-                <div>
-                  <h2 className="card-title">Actividad del contrato (eventos)</h2>
-                  <p className="text-sm opacity-70">
-                    Vista reciente on-chain de <b>VotacionCreada</b> y <b>VotoEmitido</b>. (Optimizado: solo últimos{" "}
-                    {MAX_EVENTOS_MOSTRAR})
-                  </p>
-                </div>
-
-                <Paginador
-                  pagina={paginaActividadSegura}
-                  totalPaginas={totalPaginasActividad}
-                  onCambiar={setPaginaActividad}
-                  deshabilitado={cargando}
-                />
-              </div>
-
-              <div className="overflow-x-auto mt-4">
-                <table className="table table-zebra">
-                  <thead>
-                    <tr>
-                      <th>Tipo</th>
-                      <th>Edad</th>
-                      <th>Bloque</th>
-                      <th>Tx</th>
-                      <th>Detalle</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {!tieneContracto ? (
-                      <tr>
-                        <td colSpan={5}>
-                          <div className="opacity-70">Sin contrato detectado.</div>
-                        </td>
-                      </tr>
-                    ) : actividadPagina.length === 0 ? (
-                      <tr>
-                        <td colSpan={5}>
-                          <div className="opacity-70">Sin resultados con estos filtros.</div>
-                        </td>
-                      </tr>
-                    ) : (
-                      actividadPagina.map((a, i) => (
-                        <tr key={`${a.txHash}-${i}`}>
-                          <td>
-                            <span
-                              className={`badge ${a.tipo === "VotacionCreada" ? "badge-primary" : "badge-secondary"}`}
-                            >
-                              {a.tipo === "VotacionCreada" ? "Votación creada" : "Voto emitido"}
-                            </span>
-                          </td>
-
-                          <td className="font-mono text-xs">{tiempoHace(a.timestamp)}</td>
-
-                          <td className="font-mono">
-                            {explorerBase ? (
-                              <a
-                                className="link"
-                                href={construirLink(explorerBase, "block", a.bloque)}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {a.bloque.toString()}
-                              </a>
-                            ) : (
-                              a.bloque.toString()
-                            )}
-                          </td>
-
-                          <td className="font-mono">
-                            <div className="flex items-center gap-2">
-                              {explorerBase ? (
-                                <a
-                                  className="link"
-                                  href={construirLink(explorerBase, "tx", a.txHash)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {acortarHash(a.txHash)}
-                                </a>
-                              ) : (
-                                <span>{acortarHash(a.txHash)}</span>
-                              )}
-                              <button
-                                className="btn btn-ghost btn-xs"
-                                onClick={() => copiarAlPortapapeles(a.txHash)}
-                                type="button"
-                              >
-                                Copiar
-                              </button>
-                            </div>
-                          </td>
-
-                          <td>
-                            {a.tipo === "VotacionCreada" ? (
-                              <div className="text-sm">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="badge badge-ghost">ID: {a.idVotacion?.toString() ?? "—"}</span>
-                                  <span className="badge badge-ghost">
-                                    Opciones: {a.cantidadOpciones?.toString() ?? "—"}
-                                  </span>
-                                  <span className="badge badge-ghost">Creador: {acortarDireccion(a.creador)}</span>
-                                  {a.fechaFin && (
-                                    <span className="badge badge-ghost">
-                                      Fin: {new Date(Number(a.fechaFin) * 1000).toLocaleString()}
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="mt-2 font-semibold break-words">{a.titulo ?? "—"}</div>
-                              </div>
-                            ) : (
-                              <div className="text-sm">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="badge badge-ghost">ID: {a.idVotacion?.toString() ?? "—"}</span>
-                                  <span className="badge badge-ghost">
-                                    Opción: {a.idOpcion !== undefined ? (Number(a.idOpcion) + 1).toString() : "—"}
-                                  </span>
-                                  <span className="badge badge-ghost">Votante: {acortarDireccion(a.votante)}</span>
-                                </div>
-                              </div>
-                            )}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="mt-4 flex justify-end">
-                <Paginador
-                  pagina={paginaActividadSegura}
-                  totalPaginas={totalPaginasActividad}
-                  onCambiar={setPaginaActividad}
-                  deshabilitado={cargando}
-                />
-              </div>
-
-              <div className="text-xs opacity-70 mt-3">
-                Tip para defensa: “Esta pantalla muestra la actividad reciente del contrato (últimos eventos) optimizada
-                para no depender de indexadores.”
-              </div>
-            </div>
+      {/* LISTA */}
+      <div className="p-6 max-w-6xl mx-auto">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="text-sm opacity-70">
+            Mostrando <span className="font-semibold">{Math.min(cantidadVisible, idsOrdenados.length)}</span> de{" "}
+            <span className="font-semibold">{idsOrdenados.length}</span> votación(es).
+            <span className="ml-2 opacity-60">(Los filtros se aplican dentro de cada tarjeta)</span>
           </div>
-        )}
 
-        {/* TRANSACCIONES */}
-        {pestana === "transacciones" && (
-          <div className="card bg-base-100 border border-base-300">
-            <div className="card-body">
-              <div className="flex items-start justify-between gap-3 flex-wrap">
-                <div>
-                  <h2 className="card-title">Transacciones del contrato</h2>
-                  <p className="text-sm opacity-70">
-                    Tx únicas derivadas de los eventos cargados. (Vista reciente optimizada).
-                  </p>
-                </div>
-
-                <Paginador
-                  pagina={paginaTxSegura}
-                  totalPaginas={totalPaginasTx}
-                  onCambiar={setPaginaTx}
-                  deshabilitado={cargando}
-                />
-              </div>
-
-              <div className="overflow-x-auto mt-4">
-                <table className="table table-zebra">
-                  <thead>
-                    <tr>
-                      <th>Tx</th>
-                      <th>Bloque</th>
-                      <th>Edad</th>
-                      <th>Acción</th>
-                      <th>Referencia</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {!tieneContracto ? (
-                      <tr>
-                        <td colSpan={5}>
-                          <div className="opacity-70">Sin contrato detectado.</div>
-                        </td>
-                      </tr>
-                    ) : txPagina.length === 0 ? (
-                      <tr>
-                        <td colSpan={5}>
-                          <div className="opacity-70">Sin resultados con estos filtros.</div>
-                        </td>
-                      </tr>
-                    ) : (
-                      txPagina.map((t, i) => (
-                        <tr key={`${t.txHash}-${i}`}>
-                          <td className="font-mono">
-                            <div className="flex items-center gap-2">
-                              {explorerBase ? (
-                                <a
-                                  className="link"
-                                  href={construirLink(explorerBase, "tx", t.txHash)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {acortarHash(t.txHash)}
-                                </a>
-                              ) : (
-                                <span>{acortarHash(t.txHash)}</span>
-                              )}
-                              <button
-                                className="btn btn-ghost btn-xs"
-                                onClick={() => copiarAlPortapapeles(t.txHash)}
-                                type="button"
-                              >
-                                Copiar
-                              </button>
-                            </div>
-                          </td>
-
-                          <td className="font-mono">
-                            {explorerBase ? (
-                              <a
-                                className="link"
-                                href={construirLink(explorerBase, "block", t.bloque)}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {t.bloque.toString()}
-                              </a>
-                            ) : (
-                              t.bloque.toString()
-                            )}
-                          </td>
-
-                          <td className="font-mono text-xs">{tiempoHace(t.timestamp)}</td>
-
-                          <td>
-                            <span
-                              className={`badge ${t.tipo === "VotacionCreada" ? "badge-primary" : "badge-secondary"}`}
-                            >
-                              {t.tipo === "VotacionCreada" ? "Crear votación" : "Votar"}
-                            </span>
-                          </td>
-
-                          <td className="text-sm">
-                            {t.idVotacion !== undefined ? (
-                              <span className="badge badge-ghost">ID: {t.idVotacion.toString()}</span>
-                            ) : (
-                              <span className="opacity-70">—</span>
-                            )}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="mt-4 flex justify-end">
-                <Paginador
-                  pagina={paginaTxSegura}
-                  totalPaginas={totalPaginasTx}
-                  onCambiar={setPaginaTx}
-                  deshabilitado={cargando}
-                />
-              </div>
-
-              <div className="text-xs opacity-70 mt-3">Nota: vista reciente para demo estable en Sepolia.</div>
+          {idsOrdenados.length > 0 && (
+            <div className="join">
+              <button
+                className="btn btn-sm join-item"
+                onClick={() => setCantidadVisible(8)}
+                disabled={cantidadVisible <= 8}
+              >
+                Reset
+              </button>
+              <button
+                className="btn btn-sm join-item"
+                onClick={() => setCantidadVisible(v => Math.min(v + pasoCarga, idsOrdenados.length))}
+                disabled={cantidadVisible >= idsOrdenados.length}
+              >
+                Cargar {pasoCarga} más
+              </button>
+              <button
+                className="btn btn-sm join-item"
+                onClick={() => setCantidadVisible(idsOrdenados.length)}
+                disabled={cantidadVisible >= idsOrdenados.length}
+              >
+                Ver todas
+              </button>
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
-        {/* BLOQUES */}
-        {pestana === "bloques" && (
-          <div className="card bg-base-100 border border-base-300">
-            <div className="card-body">
-              <div className="flex items-start justify-between gap-3 flex-wrap">
-                <div>
-                  <h2 className="card-title">Bloques recientes</h2>
-                  <p className="text-sm opacity-70">
-                    Últimos bloques de la red actual. (Vista tipo explorer, versión simple).
-                  </p>
-                </div>
-              </div>
-
-              <div className="overflow-x-auto mt-4">
-                <table className="table table-zebra">
-                  <thead>
-                    <tr>
-                      <th>Bloque</th>
-                      <th>Edad</th>
-                      <th>Miner</th>
-                      <th>Txs</th>
-                      <th>Base fee</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bloques.length === 0 ? (
-                      <tr>
-                        <td colSpan={5}>
-                          <div className="opacity-70">Sin datos de bloques (recarga).</div>
-                        </td>
-                      </tr>
-                    ) : (
-                      bloques.map((b: any) => (
-                        <tr key={b.hash}>
-                          <td className="font-mono">
-                            {explorerBase ? (
-                              <a
-                                className="link"
-                                href={construirLink(explorerBase, "block", b.number)}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {String(b.number)}
-                              </a>
-                            ) : (
-                              String(b.number)
-                            )}
-                          </td>
-                          <td className="font-mono text-xs">{tiempoHace(Number(b.timestamp ?? 0n))}</td>
-                          <td className="font-mono">{acortarDireccion(b.miner)}</td>
-                          <td>{b.transactions?.length ?? "—"}</td>
-                          <td className="font-mono text-xs">
-                            {b.baseFeePerGas ? `${b.baseFeePerGas.toString()} wei` : "—"}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="text-xs opacity-70 mt-3">
-                En Hardhat local, el “miner” puede verse distinto. En Sepolia se parece más al explorer real.
-              </div>
+        <div className="mt-4 grid gap-4">
+          {idsOrdenados.length === 0 ? (
+            <div className="alert">
+              <span>No hay votaciones creadas todavía.</span>
             </div>
+          ) : (
+            idsParaRender.map(id => (
+              <TarjetaVotacion key={id} idVotacion={id} busqueda={busqueda} filtroEstado={filtroEstado} />
+            ))
+          )}
+        </div>
+
+        {cantidadVisible < idsOrdenados.length && (
+          <div className="mt-6 flex justify-center">
+            <button
+              className="btn btn-primary btn-wide"
+              onClick={() => setCantidadVisible(v => Math.min(v + pasoCarga, idsOrdenados.length))}
+            >
+              Cargar más votaciones
+            </button>
           </div>
         )}
       </div>
@@ -1037,115 +251,689 @@ export default function PaginaExplorador() {
   );
 }
 
-/** Paginador reusable (UI pro, simple y clara) */
-function Paginador({
-  pagina,
-  totalPaginas,
-  onCambiar,
-  deshabilitado,
-}: {
-  pagina: number;
-  totalPaginas: number;
-  onCambiar: (p: number) => void;
-  deshabilitado?: boolean;
-}) {
-  const puedeAtras = pagina > 1;
-  const puedeAdelante = pagina < totalPaginas;
+function FormularioCrearVotacion() {
+  type UnidadDuracion = "minutos" | "horas" | "dias" | "semanas";
 
-  const paginas = useMemo(() => {
-    const w = 5;
-    const inicio = Math.max(1, pagina - Math.floor(w / 2));
-    const fin = Math.min(totalPaginas, inicio + w - 1);
-    const inicioAjustado = Math.max(1, fin - w + 1);
+  const [abierto, setAbierto] = useState(true);
+  const [titulo, setTitulo] = useState("");
 
-    const arr: number[] = [];
-    for (let i = inicioAjustado; i <= fin; i++) arr.push(i);
-    return arr;
-  }, [pagina, totalPaginas]);
+  // ✅ Opciones como lista (mejor UX)
+  const [opciones, setOpciones] = useState<string[]>(["Sí", "No"]);
+  const [nuevaOpcion, setNuevaOpcion] = useState("");
+
+  // ✅ Duración avanzada (min/h/d/sem) con tope 30 días
+  const MAX_SEGUNDOS = 30 * 24 * 60 * 60; // 30 días (1 mes)
+  const [unidadDuracion, setUnidadDuracion] = useState<UnidadDuracion>("minutos");
+  const [duracionValor, setDuracionValor] = useState<number>(10);
+
+  const factorUnidad = useMemo(() => {
+    if (unidadDuracion === "minutos") return 60;
+    if (unidadDuracion === "horas") return 60 * 60;
+    if (unidadDuracion === "dias") return 24 * 60 * 60;
+    return 7 * 24 * 60 * 60; // semanas
+  }, [unidadDuracion]);
+
+  const duracionSegundos = useMemo(() => {
+    const v = Number.isFinite(duracionValor) ? duracionValor : 0;
+    const bruto = Math.max(0, Math.floor(v * factorUnidad));
+    return Math.min(bruto, MAX_SEGUNDOS);
+  }, [duracionValor, factorUnidad]);
+
+  const tituloOk = titulo.trim().length > 0;
+  const opcionesOk = opciones.filter(o => o.trim().length > 0).length >= 2;
+  const duracionOk = duracionSegundos > 0;
+  const puedeCrear = tituloOk && opcionesOk && duracionOk;
+
+  const { writeContractAsync, isPending } = useScaffoldWriteContract({
+    contractName: "VotacionUniversitaria",
+  });
+
+  const agregarOpcion = useCallback(() => {
+    const valor = nuevaOpcion.trim();
+    if (!valor) return;
+
+    const existe = opciones.some(o => o.trim().toLowerCase() === valor.toLowerCase());
+    if (existe) {
+      notification.error("Esa opción ya existe.");
+      return;
+    }
+
+    setOpciones(prev => [...prev, valor]);
+    setNuevaOpcion("");
+  }, [nuevaOpcion, opciones]);
+
+  const eliminarOpcion = useCallback((idx: number) => {
+    setOpciones(prev => prev.filter((_, i) => i !== idx));
+  }, []);
+
+  const moverArriba = useCallback((idx: number) => {
+    setOpciones(prev => {
+      if (idx <= 0) return prev;
+      const copia = [...prev];
+      [copia[idx - 1], copia[idx]] = [copia[idx], copia[idx - 1]];
+      return copia;
+    });
+  }, []);
+
+  const moverAbajo = useCallback((idx: number) => {
+    setOpciones(prev => {
+      if (idx >= prev.length - 1) return prev;
+      const copia = [...prev];
+      [copia[idx + 1], copia[idx]] = [copia[idx], copia[idx + 1]];
+      return copia;
+    });
+  }, []);
+
+  const actualizarOpcion = useCallback((idx: number, valor: string) => {
+    setOpciones(prev => {
+      const copia = [...prev];
+      copia[idx] = valor;
+      return copia;
+    });
+  }, []);
+
+  const limpiar = useCallback(() => {
+    setTitulo("");
+    setOpciones(["Sí", "No"]);
+    setNuevaOpcion("");
+    setUnidadDuracion("minutos");
+    setDuracionValor(10);
+  }, []);
+
+  // ✅ Preview final (limpio + sin vacíos)
+  const opcionesFinales = useMemo(() => opciones.map(o => o.trim()).filter(Boolean), [opciones]);
 
   return (
-    <div className="join">
-      <button
-        className="btn btn-sm join-item"
-        onClick={() => onCambiar(1)}
-        disabled={!puedeAtras || deshabilitado}
-        type="button"
-        title="Primera"
-      >
-        «
-      </button>
-      <button
-        className="btn btn-sm join-item"
-        onClick={() => onCambiar(pagina - 1)}
-        disabled={!puedeAtras || deshabilitado}
-        type="button"
-        title="Anterior"
-      >
-        ‹
-      </button>
+    <div className="mt-6">
+      <div className="card bg-base-100 border border-base-300 shadow">
+        <div className="card-body">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="card-title">Panel del owner</h2>
+                <span className="badge badge-primary badge-outline">Admin</span>
+                <span className="badge badge-ghost">Crear votaciones</span>
+              </div>
+              <p className="text-sm opacity-70 mt-1">
+                Crea votaciones con opciones dinámicas. Se pedirá confirmación en MetaMask.
+              </p>
+            </div>
 
-      {paginas[0] !== 1 && (
-        <>
-          <button
-            className="btn btn-sm join-item btn-ghost"
-            onClick={() => onCambiar(1)}
-            disabled={deshabilitado}
-            type="button"
-          >
-            1
-          </button>
-          <button className="btn btn-sm join-item btn-ghost pointer-events-none" type="button">
-            …
-          </button>
-        </>
-      )}
+            <button className="btn btn-sm btn-ghost" onClick={() => setAbierto(v => !v)}>
+              {abierto ? "Ocultar" : "Mostrar"}
+            </button>
+          </div>
 
-      {paginas.map(p => (
+          {abierto && (
+            <>
+              <div className="divider my-3" />
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div className="lg:col-span-2 space-y-4">
+                  <div className="card bg-base-200 border border-base-300">
+                    <div className="card-body p-4">
+                      <div className="flex items-center justify-between">
+                        <h3 className="font-semibold">Pregunta / Título</h3>
+                        <span className={`text-xs ${tituloOk ? "opacity-60" : "text-error"}`}>
+                          {tituloOk ? "OK" : "Requerido"}
+                        </span>
+                      </div>
+
+                      <input
+                        className="input input-bordered w-full mt-2"
+                        placeholder="Ej: ¿Debe aprobarse el nuevo reglamento?"
+                        value={titulo}
+                        onChange={e => setTitulo(e.target.value)}
+                        maxLength={120}
+                        disabled={isPending}
+                      />
+                      <div className="text-xs opacity-70 mt-2">
+                        Consejo: usa un título corto y específico (máx. 120 caracteres).
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="card bg-base-200 border border-base-300">
+                    <div className="card-body p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="font-semibold">Opciones de respuesta</h3>
+                        <span className={`text-xs ${opcionesOk ? "opacity-60" : "text-error"}`}>
+                          {opcionesOk ? `${opcionesFinales.length} opción(es)` : "Mínimo 2"}
+                        </span>
+                      </div>
+
+                      <div className="mt-3 flex flex-col md:flex-row gap-2">
+                        <input
+                          className="input input-bordered w-full"
+                          placeholder="Escribe una opción y presiona Agregar…"
+                          value={nuevaOpcion}
+                          onChange={e => setNuevaOpcion(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              agregarOpcion();
+                            }
+                          }}
+                          disabled={isPending}
+                        />
+                        <button className="btn btn-primary" onClick={agregarOpcion} disabled={isPending}>
+                          Agregar
+                        </button>
+                      </div>
+
+                      <div className="mt-4 space-y-2">
+                        {opciones.map((op, idx) => (
+                          <div
+                            key={`${idx}-${op}`}
+                            className="flex items-center gap-2 p-3 rounded-xl bg-base-100 border border-base-300"
+                          >
+                            <span className="badge badge-ghost">{idx + 1}</span>
+
+                            <input
+                              className="input input-bordered input-sm w-full"
+                              value={op}
+                              onChange={e => actualizarOpcion(idx, e.target.value)}
+                              placeholder={`Opción ${idx + 1}`}
+                              disabled={isPending}
+                            />
+
+                            <div className="join">
+                              <button
+                                className="btn btn-sm join-item"
+                                onClick={() => moverArriba(idx)}
+                                disabled={isPending || idx === 0}
+                                title="Subir"
+                                type="button"
+                              >
+                                ↑
+                              </button>
+                              <button
+                                className="btn btn-sm join-item"
+                                onClick={() => moverAbajo(idx)}
+                                disabled={isPending || idx === opciones.length - 1}
+                                title="Bajar"
+                                type="button"
+                              >
+                                ↓
+                              </button>
+                            </div>
+
+                            <button
+                              className="btn btn-sm btn-error btn-outline"
+                              onClick={() => eliminarOpcion(idx)}
+                              disabled={isPending}
+                              title="Eliminar"
+                              type="button"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="mt-3 text-xs opacity-70">
+                        Tip: usa 2–6 opciones para una demo clara. Puedes reordenar con ↑ ↓.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="card bg-base-200 border border-base-300">
+                    <div className="card-body p-4">
+                      <div className="flex items-center justify-between">
+                        <h3 className="font-semibold">Duración</h3>
+                        <span className={`text-xs ${duracionOk ? "opacity-60" : "text-error"}`}>
+                          {duracionOk ? `${duracionSegundos}s` : "Debe ser > 0"}
+                        </span>
+                      </div>
+
+                      <div className="mt-3 grid grid-cols-1 gap-3">
+                        <label className="form-control">
+                          <div className="label">
+                            <span className="label-text">Unidad</span>
+                          </div>
+                          <select
+                            className="select select-bordered"
+                            value={unidadDuracion}
+                            onChange={e => setUnidadDuracion(e.target.value as any)}
+                            disabled={isPending}
+                          >
+                            <option value="minutos">Minutos</option>
+                            <option value="horas">Horas</option>
+                            <option value="dias">Días</option>
+                            <option value="semanas">Semanas</option>
+                          </select>
+                        </label>
+
+                        <label className="form-control">
+                          <div className="label">
+                            <span className="label-text">Cantidad</span>
+                            <span className="label-text-alt opacity-70">Máximo: 30 días (1 mes)</span>
+                          </div>
+
+                          <div className="join w-full">
+                            <input
+                              type="number"
+                              className="input input-bordered join-item w-full"
+                              min={1}
+                              value={duracionValor}
+                              onChange={e => setDuracionValor(Number(e.target.value))}
+                              disabled={isPending}
+                            />
+                            <span className="btn join-item btn-ghost pointer-events-none">{unidadDuracion}</span>
+                          </div>
+
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              className="btn btn-xs"
+                              type="button"
+                              onClick={() => {
+                                setUnidadDuracion("horas");
+                                setDuracionValor(1);
+                              }}
+                              disabled={isPending}
+                            >
+                              1 hora
+                            </button>
+                            <button
+                              className="btn btn-xs"
+                              type="button"
+                              onClick={() => {
+                                setUnidadDuracion("dias");
+                                setDuracionValor(1);
+                              }}
+                              disabled={isPending}
+                            >
+                              1 día
+                            </button>
+                            <button
+                              className="btn btn-xs"
+                              type="button"
+                              onClick={() => {
+                                setUnidadDuracion("semanas");
+                                setDuracionValor(1);
+                              }}
+                              disabled={isPending}
+                            >
+                              1 semana
+                            </button>
+                            <button
+                              className="btn btn-xs"
+                              type="button"
+                              onClick={() => {
+                                setUnidadDuracion("dias");
+                                setDuracionValor(30);
+                              }}
+                              disabled={isPending}
+                            >
+                              1 mes (30 días)
+                            </button>
+                          </div>
+
+                          <div className="text-xs opacity-70 mt-3">
+                            Duración efectiva:{" "}
+                            <span className="font-mono">{Math.floor(duracionSegundos / 60)} min</span> (tope 30 días)
+                          </div>
+
+                          {duracionSegundos === MAX_SEGUNDOS && (
+                            <div className="alert alert-warning mt-3">
+                              <span>Se aplicó el máximo permitido: 30 días.</span>
+                            </div>
+                          )}
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="card bg-base-200 border border-base-300">
+                    <div className="card-body p-4">
+                      <h3 className="font-semibold">Vista previa</h3>
+
+                      <div className="mt-3 p-3 rounded-xl bg-base-100 border border-base-300">
+                        <div className="text-sm font-semibold break-words">
+                          {tituloOk ? titulo.trim() : "— Escribe un título —"}
+                        </div>
+
+                        <div className="mt-3 space-y-2">
+                          {(opcionesFinales.length ? opcionesFinales : ["— Agrega al menos 2 opciones —"]).map(
+                            (op, idx) => (
+                              <div key={`${idx}-${op}`} className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="badge badge-ghost">{idx + 1}</span>
+                                  <span className="truncate">{op}</span>
+                                </div>
+                                <span className="badge badge-ghost">0</span>
+                              </div>
+                            ),
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="card bg-base-100 border border-base-300">
+                    <div className="card-body p-4">
+                      <button
+                        className={`btn w-full ${puedeCrear ? "btn-primary" : "btn-disabled"}`}
+                        disabled={!puedeCrear || isPending}
+                        onClick={async () => {
+                          try {
+                            const tituloFinal = titulo.trim();
+
+                            await writeContractAsync({
+                              functionName: "crearVotacion",
+                              args: [tituloFinal, opcionesFinales, BigInt(duracionSegundos)],
+                            });
+
+                            notification.success("¡Votación creada con éxito!");
+                            limpiar();
+                          } catch (e: any) {
+                            notification.error(e?.shortMessage ?? e?.message ?? "Error al crear la votación");
+                          }
+                        }}
+                      >
+                        {isPending ? (
+                          <>
+                            <span className="loading loading-spinner loading-xs" /> Creando…
+                          </>
+                        ) : (
+                          "Crear votación"
+                        )}
+                      </button>
+
+                      <button className="btn btn-ghost w-full mt-2" onClick={limpiar} disabled={isPending}>
+                        Limpiar
+                      </button>
+
+                      <div className="text-xs opacity-70 mt-3">
+                        Se pedirá confirmación en MetaMask. La votación quedará registrada on-chain.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TarjetaVotacion({
+  idVotacion,
+  busqueda,
+  filtroEstado,
+}: {
+  idVotacion: number;
+  busqueda: string;
+  filtroEstado: FiltroEstado;
+}) {
+  const { address, isConnected } = useAccount();
+
+  // ✅ Estado UI: colapsar/expandir (mejora brutal con muchas votaciones)
+  const [expandida, setExpandida] = useState(false);
+
+  // ✅ Reloj en vivo para que el "restante" se actualice
+  const [ahora, setAhora] = useState(() => ahoraSegundos());
+  useEffect(() => {
+    const t = setInterval(() => setAhora(ahoraSegundos()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const { data: votacion } = useScaffoldReadContract({
+    contractName: "VotacionUniversitaria",
+    functionName: "obtenerVotacion",
+    args: [BigInt(idVotacion)],
+  });
+
+  const { data: opciones } = useScaffoldReadContract({
+    contractName: "VotacionUniversitaria",
+    functionName: "obtenerOpciones",
+    args: [BigInt(idVotacion)],
+  });
+
+  const { data: yaVoto } = useScaffoldReadContract({
+    contractName: "VotacionUniversitaria",
+    functionName: "yaVoto",
+    args: [BigInt(idVotacion), address ?? "0x0000000000000000000000000000000000000000"],
+  });
+
+  const titulo = votacion?.[0] ?? "";
+  const creador = votacion?.[1] ?? "0x0000000000000000000000000000000000000000";
+  const fechaFin = votacion?.[2] ?? 0n;
+  const cantidadOpciones = votacion?.[3] ?? 0n;
+  const activa = votacion?.[4] ?? false;
+
+  // ✅ Filtros (sin romper hooks): calculamos booleanos y retornamos al final
+  const q = busqueda.trim().toLowerCase();
+  const tituloLower = titulo.toLowerCase();
+
+  const debeOcultarsePorBusqueda = !!q && !tituloLower.includes(q);
+  const debeOcultarsePorEstado = (filtroEstado === "activas" && !activa) || (filtroEstado === "cerradas" && activa);
+
+  const sinDataAun = !votacion;
+  const debeOcultarse = sinDataAun || debeOcultarsePorBusqueda || debeOcultarsePorEstado;
+
+  const fin = Number(fechaFin);
+  const restante = Math.max(fin - ahora, 0);
+
+  // Heurística visual del tiempo (para que se vea “vida” aunque no tengamos fechaInicio)
+  const progresoTiempo = fin <= ahora ? 100 : Math.min(95, Math.max(5, Math.round((1 - restante / 3600) * 100)));
+
+  const estadoBadge = activa ? "badge-success" : "badge-error";
+
+  const totalOpciones = Number(cantidadOpciones);
+  const indicesOpciones = useMemo(() => Array.from({ length: totalOpciones }, (_, i) => i), [totalOpciones]);
+
+  // ✅ Guardamos votos por opción para:
+  // - calcular total
+  // - calcular porcentajes
+  // - detectar líder
+  const [votosPorOpcion, setVotosPorOpcion] = useState<Record<number, bigint>>({});
+
+  const onVotos = useCallback((idOpcion: number, votos: bigint) => {
+    setVotosPorOpcion(prev => {
+      if (prev[idOpcion] === votos) return prev;
+      return { ...prev, [idOpcion]: votos };
+    });
+  }, []);
+
+  useEffect(() => {
+    setVotosPorOpcion({});
+  }, [totalOpciones, idVotacion]);
+
+  const totalVotos = useMemo(() => sumarBigints(votosPorOpcion), [votosPorOpcion]);
+
+  const lider = useMemo(() => {
+    let mejorOpcion: number | null = null;
+    let mejorVotos = -1n;
+
+    for (const [k, v] of Object.entries(votosPorOpcion)) {
+      const idx = Number(k);
+      if (v > mejorVotos) {
+        mejorVotos = v;
+        mejorOpcion = idx;
+      }
+    }
+
+    if (mejorOpcion === null || mejorVotos <= 0n) return null;
+    return { idOpcion: mejorOpcion, votos: mejorVotos };
+  }, [votosPorOpcion]);
+
+  // ✅ Importante: el return va al final para no romper reglas de hooks
+  if (debeOcultarse) return null;
+
+  return (
+    <div className="card bg-base-100 shadow border border-base-200">
+      <div className="card-body">
+        {/* Header compacto */}
+        <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="card-title truncate">{titulo}</h3>
+              <span className={`badge ${estadoBadge}`}>{activa ? "Activa" : "Cerrada"}</span>
+              {yaVoto && <span className="badge badge-warning">Ya votaste</span>}
+              {lider && (
+                <span className="badge badge-primary">
+                  Líder: Opción {lider.idOpcion + 1} · {lider.votos.toString()} voto(s)
+                </span>
+              )}
+            </div>
+
+            <div className="mt-1 text-sm opacity-70">
+              <span className="font-semibold">ID:</span> {idVotacion} · <span className="font-semibold">Creador:</span>{" "}
+              <span className="font-mono">{acortarDireccion(creador)}</span>
+            </div>
+
+            <div className="mt-2">
+              <div className="text-xs opacity-70 flex items-center justify-between">
+                <span>Tiempo</span>
+                <span className="font-mono">{activa ? `Restante: ${formatearRestante(restante)}` : "Finalizada"}</span>
+              </div>
+              <progress className="progress w-full" value={activa ? progresoTiempo : 100} max={100} />
+            </div>
+
+            {/* Resultados mini resumen */}
+            <div className="mt-3 flex items-center gap-2 flex-wrap">
+              <span className="badge badge-ghost">Votos totales: {totalVotos.toString()}</span>
+              <button className="btn btn-sm btn-ghost" onClick={() => setExpandida(v => !v)} type="button">
+                {expandida ? "Ocultar detalles" : "Ver detalles"}
+              </button>
+            </div>
+          </div>
+
+          <div className="text-right shrink-0">
+            <div className="text-sm opacity-70">Opciones</div>
+            <div className="text-lg font-semibold">{cantidadOpciones.toString()}</div>
+            {!isConnected && <div className="mt-2 text-xs text-warning">Conecta tu wallet para votar.</div>}
+          </div>
+        </div>
+
+        {/* Detalles (colapsable) */}
+        {expandida && (
+          <>
+            <div className="divider my-3" />
+
+            <div className="grid gap-2">
+              {indicesOpciones.map(idx => (
+                <FilaOpcion
+                  key={`${idVotacion}-${idx}`}
+                  idVotacion={idVotacion}
+                  idOpcion={idx}
+                  nombreOpcion={(opciones ?? [])[idx] ?? `Opción ${idx + 1}`}
+                  activa={activa}
+                  bloqueado={!!yaVoto || !isConnected}
+                  esLider={lider?.idOpcion === idx}
+                  onVotos={onVotos}
+                  totalVotos={totalVotos}
+                />
+              ))}
+            </div>
+
+            {!isConnected && (
+              <div className="alert alert-warning mt-4">
+                <span>Conecta tu wallet para poder votar.</span>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FilaOpcion({
+  idVotacion,
+  idOpcion,
+  nombreOpcion,
+  activa,
+  bloqueado,
+  esLider,
+  onVotos,
+  totalVotos,
+}: {
+  idVotacion: number;
+  idOpcion: number;
+  nombreOpcion: string;
+  activa: boolean;
+  bloqueado: boolean;
+  esLider: boolean;
+  onVotos: (idOpcion: number, votos: bigint) => void;
+  totalVotos: bigint;
+}) {
+  const { data: votos } = useScaffoldReadContract({
+    contractName: "VotacionUniversitaria",
+    functionName: "obtenerVotos",
+    args: [BigInt(idVotacion), BigInt(idOpcion)],
+  });
+
+  useEffect(() => {
+    if (typeof votos !== "undefined") {
+      onVotos(idOpcion, votos);
+    }
+  }, [votos, idOpcion, onVotos]);
+
+  const { writeContractAsync, isPending } = useScaffoldWriteContract({
+    contractName: "VotacionUniversitaria",
+  });
+
+  const deshabilitado = !activa || bloqueado || isPending;
+
+  const votosN = useMemo(() => (typeof votos === "undefined" ? 0 : bigintANumeroSeguro(votos)), [votos]);
+  const totalN = useMemo(() => bigintANumeroSeguro(totalVotos), [totalVotos]);
+  const porcentaje = totalN > 0 ? Math.round((votosN / totalN) * 100) : 0;
+
+  return (
+    <div
+      className={[
+        "p-3 rounded-xl border transition",
+        esLider ? "bg-base-100 border-primary shadow-sm" : "bg-base-200 border-base-300",
+      ].join(" ")}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 w-full">
+          <div className="font-semibold truncate flex items-center gap-2">
+            <span className="badge badge-ghost">{idOpcion + 1}</span>
+            <span className="truncate">{nombreOpcion}</span>
+            {esLider && <span className="badge badge-primary badge-sm">Líder</span>}
+          </div>
+
+          {/* Resultados: % + barra + votos */}
+          <div className="mt-2">
+            <div className="flex items-center justify-between text-xs opacity-70">
+              <span>{totalN > 0 ? `${porcentaje}%` : "0%"}</span>
+              <span className="font-mono">{votos?.toString() ?? "0"} voto(s)</span>
+            </div>
+            <progress className="progress w-full" value={porcentaje} max={100} />
+          </div>
+        </div>
+
         <button
-          key={p}
-          className={`btn btn-sm join-item ${p === pagina ? "btn-active" : "btn-ghost"}`}
-          onClick={() => onCambiar(p)}
+          className={`btn btn-sm ${deshabilitado ? "btn-ghost" : "btn-primary"}`}
           disabled={deshabilitado}
-          type="button"
+          onClick={async () => {
+            try {
+              await writeContractAsync({
+                functionName: "votar",
+                args: [BigInt(idVotacion), BigInt(idOpcion)],
+              });
+              notification.success("¡Voto emitido con éxito!");
+            } catch (e: any) {
+              notification.error(e?.shortMessage ?? e?.message ?? "Error al votar");
+            }
+          }}
         >
-          {p}
+          {isPending ? <span className="loading loading-spinner loading-xs" /> : "Votar"}
         </button>
-      ))}
+      </div>
 
-      {paginas[paginas.length - 1] !== totalPaginas && (
-        <>
-          <button className="btn btn-sm join-item btn-ghost pointer-events-none" type="button">
-            …
-          </button>
-          <button
-            className="btn btn-sm join-item btn-ghost"
-            onClick={() => onCambiar(totalPaginas)}
-            disabled={deshabilitado}
-            type="button"
-          >
-            {totalPaginas}
-          </button>
-        </>
+      {/* Mensajes UX */}
+      {!activa && <div className="mt-2 text-xs opacity-70">Votación cerrada: ya no se aceptan votos.</div>}
+      {bloqueado && activa && (
+        <div className="mt-2 text-xs text-warning">No puedes votar (ya votaste o no estás conectado).</div>
       )}
-
-      <button
-        className="btn btn-sm join-item"
-        onClick={() => onCambiar(pagina + 1)}
-        disabled={!puedeAdelante || deshabilitado}
-        type="button"
-        title="Siguiente"
-      >
-        ›
-      </button>
-      <button
-        className="btn btn-sm join-item"
-        onClick={() => onCambiar(totalPaginas)}
-        disabled={!puedeAdelante || deshabilitado}
-        type="button"
-        title="Última"
-      >
-        »
-      </button>
     </div>
   );
 }
